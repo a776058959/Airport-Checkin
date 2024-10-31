@@ -32,7 +32,11 @@ def checkin(email=os.environ.get('EMAIL'), password=os.environ.get('PASSWORD'),
     }
     response = session.post(base_url + '/user/checkin', headers=headers,
                             verify=False)
-    response = json.loads(response.text)
+    try:
+        response = json.loads(response.text)
+    except json.decoder.JSONDecodeError:
+        print("JSONDecodeError: No valid JSON object could be decoded from the string.")
+        print(response.text)
     print(response['msg'])
     return response['msg']
 
