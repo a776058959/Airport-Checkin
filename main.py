@@ -25,7 +25,7 @@ def sky():
         chrome_options = Options()
         chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
         chrome_options.add_argument("--headless")
-        chrome_options.add_argument('--ignore-certificate-errors') 
+        #chrome_options.add_argument('--ignore-certificate-errors') 
         chrome_options.add_argument('--ignore-ssl-errors')
         driver = webdriver.Chrome(service=Service('/usr/bin/chromedriver'), options=chrome_options)
         capabilities = DesiredCapabilities.CHROME.copy()
