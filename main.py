@@ -21,13 +21,12 @@ TG_BOT_TOKEN = os.environ.get('TGBOT')
 TG_USER_ID = os.environ.get('TGUSERID')
 
 def sky():
-        options = webdriver.ChromeOptions()
-        options.add_experimental_option("excludeSwitches", ["enable-logging"])
-        options.add_argument("--headless")
-        driver = webdriver.Chrome('/usr/bin/chromedriver', options=options)
         chrome_options = Options()
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
+        chrome_options.add_argument("--headless")
         chrome_options.add_argument('--ignore-certificate-errors') 
         chrome_options.add_argument('--ignore-ssl-errors')
+        driver = webdriver.Chrome('/usr/bin/chromedriver', options=chrome_options)
         capabilities = DesiredCapabilities.CHROME.copy()
         capabilities['acceptInsecureCerts'] = True
         try:
