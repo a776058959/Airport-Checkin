@@ -21,21 +21,22 @@ SCKEY = os.environ.get('SCKEY')
 TG_BOT_TOKEN = os.environ.get('TGBOT')
 TG_USER_ID = os.environ.get('TGUSERID')
 
-def sky():
-        chrome_options = Options()
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument('--ignore-certificate-errors') 
-        chrome_options.add_argument('--ignore-ssl-errors')
-        driver = webdriver.Chrome(options=chrome_options)
-        capabilities = DesiredCapabilities.CHROME.copy()
-        capabilities['acceptInsecureCerts'] = True
-        try:
-            # 找到滑块按钮元素
-            driver.get(base_url)
+chrome_options = Options()
+chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
+chrome_options.add_argument("--headless")
+chrome_options.add_argument('--ignore-certificate-errors') 
+chrome_options.add_argument('--ignore-ssl-errors')
+driver = webdriver.Chrome(options=chrome_options)
+capabilities = DesiredCapabilities.CHROME.copy()
+capabilities['acceptInsecureCerts'] = True
 
+def sky(email=os.environ.get('EMAIL'), password=os.environ.get('PASSWORD'),
+            base_url=os.environ.get('BASE_URL'), ):
+        try:
+            print("寻找滑块按钮元素")
+            driver.get(base_url)
             slider = driver.find_element(By.ID, "handler")
-            # 使用ActionChains来模拟滑动
+            print("使用ActionChains来模拟滑动")
             actions = ActionChains(driver)
             actions.click_and_hold(slider)  # 按住滑块
             actions.move_by_offset(322, 0)  # 向右滑动，可以根据需要调整滑动距离
@@ -50,7 +51,8 @@ def sky():
             logi()
             return
         
-def logi():
+def logi(email=os.environ.get('EMAIL'), password=os.environ.get('PASSWORD'),
+            base_url=os.environ.get('BASE_URL'), ):
     lurl = base_url + '/auth/login'
     driver.get(lurl)
     time.sleep(5)
