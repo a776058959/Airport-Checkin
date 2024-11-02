@@ -10,6 +10,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from lxml import etree
 import re
 import subprocess
@@ -26,7 +27,7 @@ def sky():
         chrome_options.add_argument("--headless")
         chrome_options.add_argument('--ignore-certificate-errors') 
         chrome_options.add_argument('--ignore-ssl-errors')
-        driver = webdriver.Chrome('/usr/bin/chromedriver', options=chrome_options)
+        driver = webdriver.Chrome(service=Service('/usr/bin/chromedriver'), options=chrome_options)
         capabilities = DesiredCapabilities.CHROME.copy()
         capabilities['acceptInsecureCerts'] = True
         try:
