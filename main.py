@@ -80,7 +80,7 @@ def logi(email=os.environ.get('EMAIL'), password=os.environ.get('PASSWORD'),
             print(qd)
             if qd == "已签到":
                 print("------已签到")
-            else
+            else:
                 print("尝试签到")
                 qd()
             ll()
