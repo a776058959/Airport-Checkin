@@ -77,14 +77,14 @@ def logi(email=os.environ.get('EMAIL'), password=os.environ.get('PASSWORD'),
         try:
             qd = driver.find_element(By.XPATH, '//*[@id="kt_subheader"]/div/div[2]/a')
             time.sleep(1)
-            print(qd.text)
+            print("当前按钮为:" + qd.text)
             if qd.text == "已签到":
                 print("------已签到")
             else:
                 print("尝试签到")
                 qd.click()
                 print("------签到完成")
-                return
+                driver.get(lurl)
             ll()
             return
         except :
