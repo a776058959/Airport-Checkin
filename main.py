@@ -82,21 +82,16 @@ def logi(email=os.environ.get('EMAIL'), password=os.environ.get('PASSWORD'),
                 print("------已签到")
             else:
                 print("尝试签到")
-                qd()
+                qd.click()
+                print("------签到完成")
+                return
             ll()
             return
         except :
-            try:
-                print("尝试签到")
-                qd()
-            except:
-                print("------签到报错")
-                driver.get_screenshot_as_file('screenshot0.png')
-                driver.save_screenshot("screenshot1.png")
-                print("------查看出错网页截图")
-            else:
-                print("------签到成功")
-                ll()
+            print("------签到报错")
+            driver.get_screenshot_as_file('screenshot0.png')
+            driver.save_screenshot("screenshot1.png")
+            print("------查看出错网页截图")
     finally:
         print("完成")
         time.sleep(5)
@@ -108,6 +103,7 @@ def ll():
     print("剩余流量:" + syll)
     print(yyll)
 def qd():
+    print("点击签到按钮")
     driver.find_element(By.XPATH, '//*[@id="kt_subheader"]/div/div[2]/a').click()
 
 def checkin(email=os.environ.get('EMAIL'), password=os.environ.get('PASSWORD'),
