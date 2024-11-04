@@ -75,14 +75,20 @@ def logi(email=os.environ.get('EMAIL'), password=os.environ.get('PASSWORD'),
         time.sleep(5)
         # 尝试读取已签到标签
         try:
-            driver.find_element(By.XPATH, '//*[@id="kt_subheader"]/div/div[2]/a').text
+            qd = driver.find_element(By.XPATH, '//*[@id="kt_subheader"]/div/div[2]/a').text
             time.sleep(1)
-            print("------已签到")
+            print(qd)
+            if qd == "已签到":
+                print("------已签到")
+            else
+                print("尝试签到")
+                qd()
             ll()
             return
         except :
             try:
-                 driver.find_element(By.ID, "checkin").click()
+                print("尝试签到")
+                qd()
             except:
                 print("------签到报错")
                 driver.get_screenshot_as_file('screenshot0.png')
@@ -101,6 +107,8 @@ def ll():
     yyll = driver.find_element(By.XPATH, '//*[@id="kt_content"]/div[2]/div/div[2]/div[2]/div/div[2]/p').text
     print("剩余流量:" + syll)
     print(yyll)
+def qd():
+    driver.find_element(By.ID, "checkin").click()
 
 def checkin(email=os.environ.get('EMAIL'), password=os.environ.get('PASSWORD'),
             base_url=os.environ.get('BASE_URL'), ):
