@@ -33,9 +33,10 @@ class CheckinManager:
     def _init_selenium(self):
         """初始化Selenium WebDriver"""
         chrome_options = webdriver.ChromeOptions()
-        #chrome_options.add_argument("--headless")  # 无头模式
+        chrome_options.add_argument("--headless")  # 无头模式
         chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
+        #chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
         chrome_options.add_argument('--ignore-certificate-errors')
         chrome_options.add_argument('--ignore-ssl-errors')
         return webdriver.Chrome(options=chrome_options)
@@ -201,6 +202,7 @@ class CheckinManager:
 
 if __name__ == "__main__":
     try:
+        
         manager = CheckinManager()
         manager.run()
     except Exception as e:
