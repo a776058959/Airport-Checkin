@@ -176,7 +176,7 @@ class CheckinManager:
         result = ""
         try:
             # 判断是否需要Selenium流程
-            if "fawncloud" in self.base_url:
+            if "skyvpn" in self.base_url:
                 self.handle_slider()
                 self.selenium_login()
                 result = self.selenium_checkin()
