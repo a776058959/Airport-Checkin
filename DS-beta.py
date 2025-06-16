@@ -105,7 +105,7 @@ class CheckinManager:
             # 执行签到
             print("111")
             checkin_btn = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((By.ID, "checkin"))
+                EC.element_to_be_clickable((By.XPATH, '//*[@id="checkin"]'))
             )
             checkin_btn.click()
             print("签到请求已发送")
