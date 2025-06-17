@@ -71,8 +71,8 @@ class CheckinManager:
             # 填写邮箱
             email_field = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.ID, "email"))
-                print("填写邮箱...")
             )
+            print("填写邮箱...")
             email_field.send_keys(self.email)
             
             # 填写密码
@@ -103,6 +103,7 @@ class CheckinManager:
                     self.chechll()
                     return "今日已签到"
             except:
+                print("今日未签到...")
                 pass
             
             # 执行签到
@@ -114,6 +115,8 @@ class CheckinManager:
             print("签到请求已发送")
             time.sleep(5)  # 等待结果加载
             
+            driver.refresh()
+            time.sleep(3)
             self.chechll()
             return "签到成功"
         except Exception as e:
@@ -182,8 +185,10 @@ class CheckinManager:
             if "skyvpn" in self.base_url:
                 self.handle_slider()
                 self.selenium_login()
+                self.chechll()
                 result = self.selenium_checkin()
             else:
+                self.chechll()
                 result = self.requests_checkin()
                 
             print(f"最终结果：{result}")
