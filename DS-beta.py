@@ -71,12 +71,14 @@ class CheckinManager:
             # 填写邮箱
             email_field = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.ID, "email"))
+                print("填写邮箱...")
             )
             email_field.send_keys(self.email)
             
             # 填写密码
             password_field = self.driver.find_element(By.ID, "password")
             password_field.send_keys(self.password)
+            print("填写密码...")
             
             # 提交登录
             self.driver.find_element(By.ID, "login_submit").click()
@@ -92,6 +94,7 @@ class CheckinManager:
             self.driver.get(f"{self.base_url}/user")
             try:
                 # 检查是否已签到
+                print("检查是否已签到...")
                 checkin_status = WebDriverWait(self.driver, 5).until(
                     EC.presence_of_element_located((By.XPATH, '//*[@id="kt_subheader"]/div/div[2]/a'))
                 ).text
@@ -103,13 +106,13 @@ class CheckinManager:
                 pass
             
             # 执行签到
-            print("111")
+            print("执行签到")
             checkin_btn = WebDriverWait(self.driver, 10).until(
                 EC.element_to_be_clickable((By.XPATH, '//*[@id="checkin"]'))
             )
             checkin_btn.click()
             print("签到请求已发送")
-            time.sleep(3)  # 等待结果加载
+            time.sleep(5)  # 等待结果加载
             
             self.chechll()
             return "签到成功"
