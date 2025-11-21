@@ -33,7 +33,7 @@ class CheckinManager:
     def _init_selenium(self):
         """初始化Selenium WebDriver"""
         chrome_options = webdriver.ChromeOptions()
-        #chrome_options.add_argument("--headless")  # 无头模式
+        chrome_options.add_argument("--headless")  # 无头模式
 
         # 基础选项
         chrome_options.add_argument('--no-sandbox')
