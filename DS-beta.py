@@ -90,6 +90,7 @@ class CheckinManager:
 
     def selenium_checkin(self):
         """Selenium签到流程"""
+        self.chechll()
         try:
             self.driver.get(f"{self.base_url}/user")
             try:
@@ -115,7 +116,7 @@ class CheckinManager:
             print("签到请求已发送")
             time.sleep(5)  # 等待结果加载
             
-            driver.refresh()
+            self.driver.refresh()
             time.sleep(3)
             self.chechll()
             return "签到成功"
@@ -185,7 +186,6 @@ class CheckinManager:
             if "skyvpn" in self.base_url:
                 self.handle_slider()
                 self.selenium_login()
-                self.chechll()
                 result = self.selenium_checkin()
             else:
                 self.chechll()
