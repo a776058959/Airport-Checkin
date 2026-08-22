@@ -2,7 +2,7 @@ name: "Airport Checkin DeepSeek"
 
 on:
   schedule:
-    - cron: "0 22 * * *"  # scheduled at 06:00 (UTC+8) everyday
+    - cron: "0 22 * * *"   # 每天 UTC 22:00（北京时间 06:00）
   workflow_dispatch:
 
 env:
@@ -11,19 +11,17 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # if: github.ref == 'refs/heads/master'
 
     steps:
       - name: Checkout master
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-          # ref: master
 
-      - name: Set up python
+      - name: Set up Python
         uses: actions/setup-python@v3
         with:
-          python-version: 3.13
+          python-version: '3.12'   # 改为 3.12，避免兼容问题
 
       - name: Random sleep
         if: github.event_name == 'schedule'
@@ -33,6 +31,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium --with-deps
+
       - name: Run sign
         env:
           SCKEY: ${{ secrets.SCKEY }}
@@ -41,5 +44,6 @@ jobs:
           BASE_URL: ${{ secrets.BASE_URL }}
           TGBOT: ${{ secrets.TGBOT }}
           TGUSERID: ${{ secrets.TGUSERID }}
+          # HEADLESS 无需设置，脚本会自动检测 GitHub Actions 环境
         run: |
           python3 ./DS-beta.py
