@@ -15,7 +15,6 @@ requests.packages.urllib3.disable_warnings()
 
 class CheckinManager:
     def __init__(self):
-        # 必须从环境变量读取敏感信息
         self.email = os.environ.get('EMAIL')
         self.password = os.environ.get('PASSWORD')
         self.base_url = os.environ.get('BASE_URL')
@@ -23,12 +22,11 @@ class CheckinManager:
         if not all([self.email, self.password, self.base_url]):
             raise ValueError("必须设置环境变量 EMAIL, PASSWORD, BASE_URL")
 
-        # 确保 base_url 格式正确
         if not self.base_url.startswith(('http://', 'https://')):
             self.base_url = 'https://' + self.base_url
             print(f"自动添加协议前缀: {self.base_url}")
 
-        # 自动检测无头模式：优先环境变量，否则根据 GITHUB_ACTIONS 判断
+        # 无头模式自动检测
         headless_env = os.environ.get('HEADLESS')
         if headless_env is not None:
             self.headless = headless_env.lower() == 'true'
@@ -36,7 +34,7 @@ class CheckinManager:
             self.headless = os.environ.get('GITHUB_ACTIONS', 'false').lower() == 'true'
         print(f"无头模式: {'开启' if self.headless else '关闭'}")
 
-        # Cloudflare 点击坐标（支持环境变量覆盖）
+        # Cloudflare 点击坐标
         coord_str = os.environ.get('CLICK_COORD', '')
         if coord_str:
             try:
@@ -49,9 +47,9 @@ class CheckinManager:
 
         if not coord_str:
             if "skyvpn" in self.base_url:
-                self.click_coord = (430, 310)   # skyvpnx.com 默认坐标
+                self.click_coord = (430, 310)
             else:
-                self.click_coord = (800, 550)   # 通用默认坐标
+                self.click_coord = (800, 550)
             print(f"使用默认 Cloudflare 点击坐标: {self.click_coord}")
 
         # 通知配置
@@ -59,7 +57,6 @@ class CheckinManager:
         self.tg_bot_token = os.environ.get('TGBOT', '')
         self.tg_user_id = os.environ.get('TGUSERID', '')
 
-        # Playwright 相关
         self.playwright = None
         self.browser = None
         self.context = None
@@ -85,7 +82,6 @@ class CheckinManager:
             permissions=["geolocation"],
         )
 
-        # 注入反检测脚本
         self.context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
@@ -241,7 +237,6 @@ class CheckinManager:
             '.turnstile',
             '[data-sitekey]',
         ]
-        # 主文档
         for selector in selectors:
             try:
                 locator = self.page.locator(selector).first
@@ -251,7 +246,6 @@ class CheckinManager:
                     return True
             except Exception:
                 continue
-        # iframe
         try:
             for frame in self.page.frames:
                 for selector in selectors:
@@ -269,7 +263,6 @@ class CheckinManager:
 
     def _click_via_xpath(self):
         exact_xpath = "/html/body//div/div/div[1]/div/label/input"
-        # 主文档
         try:
             locator = self.page.locator(f"xpath={exact_xpath}")
             if locator.count() > 0:
@@ -278,7 +271,6 @@ class CheckinManager:
                 return True
         except Exception:
             pass
-        # iframe
         try:
             for frame in self.page.frames:
                 locator = frame.locator(f"xpath={exact_xpath}")
@@ -361,7 +353,7 @@ class CheckinManager:
         print("❌ Cloudflare 验证未通过")
         return False
 
-    # ==================== 登录和签到 ====================
+    # ==================== 登录（拟人化输入） ====================
     def login(self, base_url=None):
         if base_url is None:
             base_url = self.base_url
@@ -369,64 +361,132 @@ class CheckinManager:
         print(f"正在访问登录页面: {login_url}")
         self.page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
 
+        # 处理可能的 Cloudflare 验证
         if self.is_cloudflare_challenge():
             if not self.handle_cloudflare():
                 raise Exception("Cloudflare 验证未通过")
             self.page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
 
+        # 访问登录页后等待 3~5 秒
+        wait_after_load = random.uniform(3, 5)
+        print(f"等待 {wait_after_load:.2f} 秒后开始填写表单...")
+        self.page.wait_for_timeout(int(wait_after_load * 1000))
+
         try:
-            self.page.fill("#email", self.email)
-            self.page.fill("#password", self.password)
-            self.page.click("#login_submit")
+            # 定位邮箱输入框，滚动到可见并悬停
+            email_locator = self.page.locator("#email")
+            email_locator.scroll_into_view_if_needed()
+            email_locator.hover()
+            self.page.wait_for_timeout(random.randint(300, 600))
+
+            # 点击输入框，然后逐字符输入
+            email_locator.click()
+            self.page.type("#email", self.email, delay=random.randint(50, 150))
+            print("邮箱输入完成")
+            self.page.wait_for_timeout(random.randint(500, 1000))
+
+            # 定位密码输入框
+            password_locator = self.page.locator("#password")
+            password_locator.scroll_into_view_if_needed()
+            password_locator.hover()
+            self.page.wait_for_timeout(random.randint(300, 600))
+            password_locator.click()
+            self.page.type("#password", self.password, delay=random.randint(50, 150))
+            print("密码输入完成")
+            self.page.wait_for_timeout(random.randint(500, 1000))
+
+            # 登录按钮：悬停后点击
+            login_btn = self.page.locator("#login_submit")
+            login_btn.hover()
+            self.page.wait_for_timeout(random.randint(500, 1200))
+            login_btn.click()
             print("登录凭证已提交")
-            self.page.wait_for_timeout(3000)
+
+            # 提交后等待响应
+            self.page.wait_for_timeout(random.randint(3000, 5000))
             return True
+
         except Exception as e:
             print(f"登录表单操作失败: {e}")
             self.page.screenshot(path="login_fail.png")
             raise
 
+    # ==================== 签到 ====================
     def checkin(self, base_url=None):
         if base_url is None:
             base_url = self.base_url
         user_url = f"{base_url}/user"
         print(f"访问用户页面: {user_url}")
         self.page.goto(user_url, wait_until="domcontentloaded", timeout=60000)
+        # 等待页面动态内容加载
+        self.page.wait_for_timeout(3000)
 
+        # 检查整个页面是否包含“已签到”
         try:
-            status_element = self.page.locator('//*[@id="kt_subheader"]/div/div[2]/a')
-            if status_element.is_visible(timeout=5000):
-                status_text = status_element.inner_text()
-                if "已签到" in status_text:
-                    print("今日已签到，无需重复操作")
-                    self.check_traffic()
-                    return "今日已签到"
-        except:
-            print("今日未签到...")
-
-        try:
-            self.page.click('//*[@id="checkin"]', timeout=10000)
-            print("签到请求已发送")
-            self.page.wait_for_timeout(5000)
-            self.page.reload()
-            self.page.wait_for_timeout(3000)
-            self.check_traffic()
-            return "签到成功"
+            body_text = self.page.inner_text("body")
+            if "已签到" in body_text or "已经签到" in body_text or "今日已签到" in body_text:
+                print("页面显示已签到，无需操作")
+                self.check_traffic()
+                return "今日已签到"
         except Exception as e:
-            print(f"签到操作失败: {e}")
-            return f"签到失败: {e}"
+            print(f"检查已签到文本失败: {e}")
+
+        # 尝试多种签到按钮选择器
+        selectors = [
+            '#checkin',
+            '//*[@id="checkin"]',
+            'button:has-text("签到")',
+            'a:has-text("签到")',
+            '//*[contains(@class, "checkin")]',
+            '//*[contains(text(), "签到")]',
+        ]
+
+        for selector in selectors:
+            try:
+                locator = self.page.locator(selector).first
+                if locator.is_visible(timeout=5000):
+                    locator.scroll_into_view_if_needed()
+                    locator.hover()
+                    self.page.wait_for_timeout(random.randint(300, 800))
+                    locator.click(timeout=5000)
+                    print(f"签到按钮已点击: {selector}")
+                    self.page.wait_for_timeout(5000)
+                    self.page.reload()
+                    self.page.wait_for_timeout(3000)
+                    self.check_traffic()
+                    return "签到成功"
+            except Exception as e:
+                print(f"尝试选择器 {selector} 失败: {e}")
+                continue
+
+        # 保存截图
+        try:
+            self.page.screenshot(path="checkin_fail.png")
+            print("已保存截图: checkin_fail.png")
+        except:
+            pass
+        print("签到失败：未找到签到按钮")
+        return "签到失败：未找到签到按钮"
 
     def check_traffic(self):
         try:
-            traffic_selector = '//*[@id="kt_content"]/div[2]/div/div[2]/div[2]/div/div[1]/div/div/div/strong'
-            element = self.page.locator(traffic_selector)
-            if element.is_visible(timeout=5000):
-                remaining = element.inner_text()
-                print(f"剩余流量：{remaining}")
-                return remaining
-            else:
-                print("未找到流量信息")
-                return "获取失败"
+            # 尝试多种流量选择器
+            selectors = [
+                '//*[@id="kt_content"]/div[2]/div/div[2]/div[2]/div/div[1]/div/div/div/strong',
+                '//strong[contains(text(), "GB")]',
+                '//*[contains(text(), "剩余流量")]',
+            ]
+            for sel in selectors:
+                try:
+                    element = self.page.locator(sel).first
+                    if element.is_visible(timeout=3000):
+                        remaining = element.inner_text()
+                        print(f"剩余流量：{remaining}")
+                        return remaining
+                except:
+                    continue
+            print("未找到流量信息")
+            return "获取失败"
         except Exception as e:
             print(f"获取流量信息失败: {e}")
             return "获取失败"
