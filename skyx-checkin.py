@@ -425,6 +425,17 @@ class CheckinClient:
             return {"ret": 0, "msg": f"HTTP {resp.status_code}"}
 
 
+def is_already_checked(result):
+    """判断接口返回的是不是「今天已经签到过了」。
+
+    站点对重复签到不返回 ret=1，而是 ret=0 + 一句提示（如"您似乎已经签到过了"）。
+    这种情况说明今天流量已到账，属于成功，不该当失败处理。
+    """
+    msg = str(result.get("msg") or "")
+    markers = ("已经签到", "已签到", "签到过", "重复签到", "already")
+    return any(m in msg.lower() if m == "already" else m in msg for m in markers)
+
+
 def notify(result):
     """推送签到结果。Server酱 与 Telegram 各一条，失败只记录不中断。"""
     msg = str(result.get("msg") or "")
@@ -528,7 +539,11 @@ def main():
             log(f"流量信息: {json.dumps(result['trafficInfo'], ensure_ascii=False)}")
 
         notify(result)
-        return 0 if result.get("ret") == 1 else 1
+        # 「已经签到过」不算失败——说明今天的量已经到了，重复跑只会得到这句。
+        # 其它情况按接口的 ret 判断。
+        if result.get("ret") == 1 or is_already_checked(result):
+            return 0
+        return 1
 
     log("所有轮次都失败")
     return 1
