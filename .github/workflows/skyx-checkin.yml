@@ -2,7 +2,14 @@ name: "SKY VPN 自动签到"
 
 on:
   schedule:
-    - cron: "0 22 * * *"   # 每天 UTC 22:00（北京时间 06:00）
+    # GitHub 的 cron 只能指定固定时刻，没法直接随机。
+    # 所以这里只设一个凌晨触发点，再在 job 里加一段随机延迟，
+    # 把真正的签到请求打散到凌晨的一段区间里，避免每天同一分钟执行。
+    #
+    # cron 用 UTC：16:07 UTC = 次日 00:07 北京时间
+    # 之后随机延迟 0-170 分钟，实际签到落在 00:07-02:57 之间且每天不同。
+    # （不用整点 :00，那个时刻大家的定时任务最挤）
+    - cron: "7 16 * * *"
   workflow_dispatch:
 
 env:
@@ -11,7 +18,7 @@ env:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 240
 
     steps:
       - name: Checkout
@@ -22,9 +29,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Random sleep
+      # 随机延迟，把执行时刻打散。手动触发时跳过，免得白等。
+      - name: Random delay
         if: github.event_name == 'schedule'
-        run: sleep $(shuf -i 30-900 -n 1)
+        run: |
+          DELAY=$((RANDOM * 60 % 10200))
+          echo "随机延迟 ${DELAY} 秒（约 $((DELAY / 60)) 分钟）"
+          echo "预计执行时刻：$(date -u -d "+${DELAY} seconds" '+%H:%M UTC') / $(TZ=Asia/Shanghai date -d "+${DELAY} seconds" '+%H:%M 北京时间')"
+          sleep $DELAY
 
       - name: Install dependencies
         run: |
