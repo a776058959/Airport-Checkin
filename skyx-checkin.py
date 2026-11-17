@@ -26,7 +26,8 @@
     PANEL_URL   面板地址（可选，多个候选用逗号分隔）
     PANEL_CACHE 面板域名缓存文件，默认 .panel-cache
     TWOFA_CODE  两步验证码（账户开了两步验证时必需）
-    MAX_ROUNDS  整体重试轮数，默认 3
+    MAX_ROUNDS  整体重试轮数，默认 5
+    PANEL_TRIES 轮内尝试获取面板地址的次数，默认 8
     SCKEY       Server酱 key，可选
     TGBOT       Telegram bot token，可选
     TGUSERID    Telegram chat id，可选
@@ -34,6 +35,7 @@
 
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -300,57 +302,66 @@ class CheckinClient:
         return "just a moment" in body or "cf_chl_opt" in body or "challenge-platform" in body
 
     # ---------- 第 3 步：过验证后找面板 ----------
-    def discover_via_waf(self):
+    def discover_via_waf(self, tries=None):
         """过完人机验证后，找出真正的面板地址。
 
         两种可能：
           - 响应里直接 302/303 跳到别的域名 → 那是面板
           - 停在落地页，有个 continue 表单 → 提交后跳到面板
+
+        continue 接口有每 IP 配额，实测大约 40% 成功率、间隔不规则，
+        所以这里在轮内多试几次并随机间隔，比只试一次靠谱。
         """
+        if tries is None:
+            tries = int(os.environ.get("PANEL_TRIES", "8"))
         if not self.pass_waf():
             log("  人机验证未通过")
             return False
 
-        # 先看有没有直接跳转
-        resp = self._request("GET", self.base_url + "/", "GET landing")
-        location = resp.headers.get("Location")
-        if location and resp.status_code in (301, 302, 303, 307):
-            target = urljoin(self.base_url + "/", location).rstrip("/")
-            log(f"  跳转目标: {target}")
-            if self._looks_like_panel(target):
-                return self._adopt(target)
-            log("  跳转目标不是面板")
+        for attempt in range(1, tries + 1):
+            # 先看有没有直接跳转
+            resp = self._request("GET", self.base_url + "/", "GET landing")
+            location = resp.headers.get("Location")
+            if location and resp.status_code in (301, 302, 303, 307):
+                target = urljoin(self.base_url + "/", location).rstrip("/")
+                log(f"  跳转目标: {target}")
+                if self._looks_like_panel(target):
+                    return self._adopt(target)
+                log("  跳转目标不是面板")
 
-        # 落地页的 continue 表单
-        nonce = RE_PAGE_NONCE.search(resp.text)
-        if not nonce:
-            log("  落地页: 没找到 nonce，也没找到跳转")
-            return False
+            # 落地页的 continue 表单
+            nonce = RE_PAGE_NONCE.search(resp.text)
+            if not nonce:
+                log("  落地页: 没找到 nonce，也没找到跳转")
+                return False
 
-        resp = self._request(
-            "POST",
-            self.base_url + "/",
-            "POST continue",
-            headers={
-                "Referer": self.base_url + "/",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": self.base_url,
-            },
-            data={"action": "continue", "nonce": nonce.group(1)},
-        )
-        if resp.status_code == 429:
-            log("  落地页: continue 被限流（429），本 IP 的配额已用完")
-            log("            —— 面板地址来自这里，配额用完就拿不到；"
-                "缓存命中时不会走到这里")
-            return False
-        if not resp.headers.get("Location"):
-            log(f"  落地页: 提交被拒（{resp.status_code}）")
-            return False
+            resp = self._request(
+                "POST",
+                self.base_url + "/",
+                "POST continue",
+                headers={
+                    "Referer": self.base_url + "/",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": self.base_url,
+                },
+                data={"action": "continue", "nonce": nonce.group(1)},
+            )
+            if resp.status_code == 429:
+                log(f"  落地页: continue 被限流（429），第 {attempt}/{tries} 次")
+            elif not resp.headers.get("Location"):
+                log(f"  落地页: 提交被拒（{resp.status_code}），第 {attempt}/{tries} 次")
+            else:
+                target = urljoin(self.base_url + "/", resp.headers["Location"]).rstrip("/")
+                log(f"  面板地址（表单跳转）: {target}")
+                if self._looks_like_panel(target):
+                    return self._adopt(target)
+                log("  跳转目标不是面板")
 
-        target = urljoin(self.base_url + "/", resp.headers["Location"]).rstrip("/")
-        log(f"  面板地址（表单跳转）: {target}")
-        if self._looks_like_panel(target):
-            return self._adopt(target)
+            if attempt < tries:
+                # 配额是抢占式的，随机间隔更容易撞上空窗
+                wait = random.uniform(2, 12)
+                log(f"  {wait:.0f}s 后再试")
+                time.sleep(wait)
         return False
 
     # ---------- 登录 ----------
@@ -459,7 +470,7 @@ def main():
     panel_url = os.environ.get("PANEL_URL", "")
     cache_path = os.environ.get("PANEL_CACHE", DEFAULT_CACHE)
     twofa_code = os.environ.get("TWOFA_CODE", "")
-    rounds = int(os.environ.get("MAX_ROUNDS", "3"))
+    rounds = int(os.environ.get("MAX_ROUNDS", "5"))
 
     if not email or not password:
         log("必须设置 EMAIL 与 PASSWORD 环境变量")
@@ -486,8 +497,9 @@ def main():
     # 整个流程失败时退避重试，等配额窗口过去还有机会。
     for attempt in range(1, rounds + 1):
         if attempt > 1:
-            wait = min(30 * (2 ** (attempt - 2)), 300)
-            log(f"第 {attempt}/{rounds} 轮重试，{wait}s 后开始")
+            # 配额是抢占式的，随机间隔比固定间隔更容易撞上空窗
+            wait = random.uniform(20, 90)
+            log(f"第 {attempt}/{rounds} 轮重试，{wait:.0f}s 后开始")
             time.sleep(wait)
 
         client = CheckinClient(

@@ -60,6 +60,9 @@ STATE = {
     "direct_panel": False,
     # Cloudflare 挑战
     "cloudflare": False,
+    # continue 前 N 次返回 429，之后才成功
+    "continue_fail_until": 0,
+    "continue_calls": 0,
 }
 
 
@@ -181,7 +184,11 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(200, b"bad captcha")
         elif path == "/":
-            if STATE["continue_mode"] == "429":
+            STATE["continue_calls"] += 1
+            if STATE["continue_mode"] == "429" or (
+                STATE["continue_fail_until"]
+                and STATE["continue_calls"] <= STATE["continue_fail_until"]
+            ):
                 self._send(429, b"too many requests")
             else:
                 self._send(
@@ -199,6 +206,8 @@ def fresh_state():
             "continue_mode": "ok",
             "direct_panel": False,
             "cloudflare": False,
+            "continue_fail_until": 0,
+            "continue_calls": 0,
         }
     )
 
@@ -345,7 +354,19 @@ if __name__ == "__main__":
     assert cache3.written == panel, f"失效后未更新缓存: {cache3.written}"
     print("  断言通过：缓存失效后回落入口站并更新缓存")
 
-    # ---------- 7) Cloudflare 挑战应被识别并明确报错 ----------
+    # ---------- 7) 轮内多次尝试：前几次 429 之后能拿到面板 ----------
+    print("\n=== 7) 轮内多次尝试拿面板（前 3 次 429）===")
+    fresh_state()
+    STATE["continue_fail_until"] = 3
+    client10 = make()
+    import os as _os
+    _os.environ["PANEL_TRIES"] = "8"
+    assert client10.resolve_panel() is True, "轮内重试后应能拿到面板"
+    assert client10.panel_url == panel, f"面板地址不对: {client10.panel_url}"
+    assert STATE["continue_calls"] >= 4, f"continue 调用次数不对: {STATE['continue_calls']}"
+    print(f"  断言通过：continue 尝试 {STATE['continue_calls']} 次后拿到面板")
+
+    # ---------- 8) Cloudflare 挑战应被识别并明确报错 ----------
     print("\n=== 7) Cloudflare 挑战识别 ===")
     fresh_state()
     STATE["cloudflare"] = True
