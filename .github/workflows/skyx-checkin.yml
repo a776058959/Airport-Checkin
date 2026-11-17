@@ -2,23 +2,23 @@ name: "SKY VPN 自动签到"
 
 on:
   schedule:
-    # GitHub 的 cron 只能指定固定时刻，没法直接随机。
-    # 所以这里只设一个凌晨触发点，再在 job 里加一段随机延迟，
-    # 把真正的签到请求打散到凌晨的一段区间里，避免每天同一分钟执行。
+    # 三个候选时间点（UTC），间隔 2 小时，对应北京时间：
+    #   16:10 UTC -> 次日 00:10
+    #   18:10 UTC -> 次日 02:10
+    #   20:10 UTC -> 次日 04:10
     #
-    # cron 用 UTC：16:07 UTC = 次日 00:07 北京时间
-    # 之后随机延迟 0-170 分钟，实际签到落在 00:07-02:57 之间且每天不同。
-    # （不用整点 :00，那个时刻大家的定时任务最挤）
-    - cron: "7 16 * * *"
+    # 每次都先看「今天是否已签到成功」：成功过就跳过；
+    # 否则第 1、2 个时间点按概率抽取（不一定跑），第 3 个保底必跑。
+    # 这样每天的签到时刻是随机的，又不靠长时间 sleep 占着 runner。
+    - cron: "10 16 * * *"
+    - cron: "10 18 * * *"
+    - cron: "10 20 * * *"
   workflow_dispatch:
-
-env:
-  RUN_ENV: 'prod'
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -29,33 +29,88 @@ jobs:
         with:
           python-version: '3.12'
 
-      # 随机延迟，把执行时刻打散。手动触发时跳过，免得白等。
-      - name: Random delay
-        if: github.event_name == 'schedule'
+      # 恢复两个东西：
+      #   .panel-cache —— 面板地址（避免每次都撞入口站限流）
+      #   state/       —— 记录今天是否已签到成功
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .panel-cache
+            state
+          key: skyx-${{ github.run_id }}
+          restore-keys: |
+            skyx-
+
+      # 决定这次要不要真的签到
+      # 决定这次要不要真的签到。
+      #
+      # 不用 github.event.schedule 匹配 cron 字符串（格式细节不可靠），
+      # 直接看当前 UTC 小时落在哪个时间段——比字符串匹配稳。
+      #   16 点 -> 第 1 个（北京 00:10，40% 概率跑）
+      #   18 点 -> 第 2 个（北京 02:10，50% 概率跑）
+      #   其它 -> 第 3 个（北京 04:10，保底必跑）
+      - name: Decide whether to run
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          DELAY=$((RANDOM * 60 % 10200))
-          echo "随机延迟 ${DELAY} 秒（约 $((DELAY / 60)) 分钟）"
-          echo "预计执行时刻：$(date -u -d "+${DELAY} seconds" '+%H:%M UTC') / $(TZ=Asia/Shanghai date -d "+${DELAY} seconds" '+%H:%M 北京时间')"
-          sleep $DELAY
+          set -eu
+          TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)
+          LAST=$(cat state/last-success.txt 2>/dev/null || echo "")
+          HOUR=$(date -u +%H)
+
+          echo "今天（北京时间）：$TODAY"
+          echo "触发方式：$EVENT_NAME"
+          echo "当前 UTC 小时：$HOUR"
+          echo "上次成功：${LAST:-（无记录）}"
+
+          # 手动触发：无条件执行（方便调试）
+          if [ "$EVENT_NAME" != "schedule" ]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+            echo "→ 手动触发，直接执行"
+            exit 0
+          fi
+
+          # 今天已经签到成功过：跳过
+          if [ "$LAST" = "$TODAY" ]; then
+            echo "run=no" >> "$GITHUB_OUTPUT"
+            echo "→ 今天已签到成功，跳过本次"
+            exit 0
+          fi
+
+          # 按 UTC 小时决定策略
+          case "$HOUR" in
+            16) P=40; SLOT="第 1 个（北京 00:xx）" ;;
+            17) P=40; SLOT="第 1 个（延迟到 01:xx）" ;;
+            18) P=50; SLOT="第 2 个（北京 02:xx）" ;;
+            19) P=50; SLOT="第 2 个（延迟到 03:xx）" ;;
+            *)
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+              echo "→ 第 3 个（北京 04:xx 及以后）保底，必定执行"
+              exit 0
+              ;;
+          esac
+
+          R=$((RANDOM % 100))
+          if [ "$R" -lt "$P" ]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+            echo "→ $SLOT 命中随机（$R < $P），执行"
+          else
+            echo "run=no" >> "$GITHUB_OUTPUT"
+            echo "→ $SLOT 随机跳过（$R >= $P），留给后面时间点"
+          fi
 
       - name: Install dependencies
+        if: steps.decide.outputs.run == 'yes'
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
-      # 面板域名是随机分配的，唯一来源是入口站；而入口站的 continue 接口
-      # 有每 IP 配额，Actions 的共享 runner IP 常常已被占满会返回 429。
-      # 所以把已发现的面板域名缓存下来跨 run 复用，只有缓存失效时才回入口站。
-      - name: Restore panel domain cache
-        id: panel-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: .panel-cache
-          key: skyx-panel-${{ github.run_id }}
-          restore-keys: |
-            skyx-panel-
-
       - name: Run checkin
+        id: checkin
+        if: steps.decide.outputs.run == 'yes'
+        continue-on-error: true
         env:
           SCKEY: ${{ secrets.SCKEY }}
           EMAIL: ${{ secrets.EMAIL }}
@@ -67,10 +122,26 @@ jobs:
           TGUSERID: ${{ secrets.TGUSERID }}
         run: python3 ./skyx-checkin.py
 
-      # 缓存命中与否都要保存：命中时原样保存，未命中时脚本已写入新域名
-      - name: Save panel domain cache
-        if: always() && hashFiles('.panel-cache/**') != ''
+      # 只在真正成功时记「今天已完成」，失败则留给后面的时间点重试
+      - name: Mark today as done
+        if: steps.decide.outputs.run == 'yes' && steps.checkin.outcome == 'success'
+        run: |
+          mkdir -p state
+          TZ=Asia/Shanghai date +%Y-%m-%d > state/last-success.txt
+          echo "已记录：$(cat state/last-success.txt) 签到成功"
+
+      - name: Save cache
+        if: always() && steps.decide.outputs.run == 'yes'
         uses: actions/cache/save@v4
         with:
-          path: .panel-cache
-          key: skyx-panel-${{ github.run_id }}
+          path: |
+            .panel-cache
+            state
+          key: skyx-${{ github.run_id }}
+
+      # 签到失败且这是最后一个时间点时，让 job 标红，方便你发现
+      - name: Fail if checkin failed
+        if: steps.decide.outputs.run == 'yes' && steps.checkin.outcome != 'success'
+        run: |
+          echo "签到失败，等下一个时间点重试"
+          exit 1

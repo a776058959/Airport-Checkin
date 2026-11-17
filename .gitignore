@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .panel-cache/
 .panel-cache*
+state/
