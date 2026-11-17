@@ -11,7 +11,7 @@ env:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -24,7 +24,7 @@ jobs:
 
       - name: Random sleep
         if: github.event_name == 'schedule'
-        run: sleep $(shuf -i 10-300 -n 1)
+        run: sleep $(shuf -i 10-600 -n 1)
 
       - name: Install dependencies
         run: |
@@ -37,6 +37,7 @@ jobs:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
           BASE_URL: ${{ secrets.BASE_URL }}
+          PANEL_URL: ${{ secrets.PANEL_URL }}
           TWOFA_CODE: ${{ secrets.TWOFA_CODE }}
           TGBOT: ${{ secrets.TGBOT }}
           TGUSERID: ${{ secrets.TGUSERID }}
