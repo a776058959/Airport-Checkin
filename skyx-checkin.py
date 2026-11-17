@@ -10,26 +10,31 @@
            └─ POST /auth/login           返回 {ret, msg}
            └─ POST /user/checkin         返回 {ret, msg, traffic, trafficInfo}
 
-两条重要事实（决定了本脚本的结构）：
+三条关键事实（决定了本脚本的结构）：
 
 1. **GoEdge WAF 的滑动验证码是弱校验**：页面里只有 `GOEDGE_WAF_CAPTCHA_ID`
    隐藏字段与写死在 JS 里的 `nonce`，服务端只比对这两个值，不做轨迹校验。
    因此纯 requests 就能过，不需要浏览器自动化。
 
-2. **面板站是独立域名，且不需要入口站的 cookie**：面板的 `loginConfig.switch`
-   里 geetest / recaptcha 都是关的，`POST /auth/login` 直接可用。所以入口站
-   只是"发现面板域名"的一种途径，不是必经之路——GitHub Actions 的 runner
-   IP 常被 WAF 限流（429），直连面板才是稳的路。
+2. **面板域名是随机分配的**（形如 `q210ycweb.skyvpn.bond`、`subb3xq6b.skyvpn.bond`），
+   唯一获取途径是入口站落地页的 continue 表单。
+
+3. **入口站 continue 有每 IP 配额**：实测连续调 3 次，第 3 次起返回 429，
+   且 429 会连带影响后续落地页访问。GitHub Actions 的 runner IP 共享且常被
+   占满，所以不能每次都走入口站。
+
+对策是**缓存面板域名**：本地缓存文件（Actions 用 actions/cache 跨 run 持久化）
+存下已发现的域名，下次直接用；只有缓存失效时才回入口站重新发现。
 
 用法：
-    EMAIL=... PASSWORD=... PANEL_URL=https://xxx.skyvpn.bond python3 skyx-checkin.py
+    EMAIL=... PASSWORD=... python3 skyx-checkin.py
 
 环境变量：
     EMAIL       登录邮箱（必需）
     PASSWORD    登录密码（必需）
-    PANEL_URL   面板站地址（推荐填，可跳过入口站）
+    PANEL_URL   面板站地址（可选，多个候选用逗号分隔；优先于缓存）
+    PANEL_CACHE 面板域名缓存文件路径，默认 .panel-cache
     BASE_URL    入口站地址，默认 https://www.skyxcloud.cc
-                （仅在未填 PANEL_URL 时用于自动发现面板域名）
     TWOFA_CODE  两步验证码（账户开了两步验证时必需）
     SCKEY       Server酱 key，可选
     TGBOT       Telegram bot token，可选
@@ -51,15 +56,34 @@ UA = (
 )
 
 DEFAULT_BASE_URL = "https://www.skyxcloud.cc"
-
-# 已知可用的面板域名，面板域名会随站点调整而变化，这里作为兜底候选
-KNOWN_PANELS = [
-    "https://q210ycweb.skyvpn.bond",
-]
+DEFAULT_CACHE = ".panel-cache"
 
 
 def log(msg):
     print(msg, flush=True)
+
+
+class PanelCache:
+    """面板域名缓存。存下已发现的域名，避免每次都去撞入口站的限流配额。"""
+
+    def __init__(self, path=DEFAULT_CACHE):
+        self.path = path
+
+    def read(self):
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                data = fh.read().strip()
+            return data if data.startswith("http") else None
+        except OSError:
+            return None
+
+    def write(self, url):
+        try:
+            with open(self.path, "w", encoding="utf-8") as fh:
+                fh.write(url)
+            log(f"  已缓存面板域名 -> {self.path}")
+        except OSError as exc:
+            log(f"  缓存写入失败（不影响本次签到）：{exc}")
 
 
 class SkyXClient:
@@ -70,15 +94,16 @@ class SkyXClient:
     """
 
     def __init__(self, base_url=DEFAULT_BASE_URL, panel_url=None, timeout=40,
-                 candidates=None, retry_sleep=None):
+                 candidates=None, retry_sleep=None, cache=None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.entry = self._new_session()
         self.panel = self._new_session()
         self.panel_url = panel_url.rstrip("/") if panel_url else None
-        self.candidates = candidates if candidates is not None else list(KNOWN_PANELS)
+        self.candidates = candidates if candidates is not None else []
         # 退避基数，测试里可以调小
         self.retry_sleep = retry_sleep if retry_sleep is not None else 3
+        self.cache = cache if cache is not None else PanelCache()
 
     @staticmethod
     def _new_session():
@@ -134,22 +159,33 @@ class SkyXClient:
     def resolve_panel(self):
         """确定面板站地址。
 
-        优先级：
+        面板域名随机分配，唯一来源是入口站，但入口站 continue 有每 IP 配额，
+        所以按「稳 → 不稳」排序，逐个尝试：
+
           1. 显式配置的 PANEL_URL
-          2. 已知候选域名（逐个探活）
-          3. 入口站落地页跳转
+          2. 上次缓存的域名（存在缓存文件里）
+          3. 其它候选域名
+          4. 入口站落地页跳转（消耗配额，最后手段）
         """
         if self.panel_url:
             log(f"  面板站（配置）: {self.panel_url}")
-            return self._check_panel(self.panel_url)
+            if self._check_panel(self.panel_url):
+                return True
+            log("  配置的面板地址不可用，继续找别的")
+
+        cached = self.cache.read()
+        if cached:
+            log(f"  面板站（缓存）: {cached}")
+            if self._check_panel(cached):
+                return True
+            log("  缓存的面板地址已失效，重新发现")
 
         for candidate in self.candidates:
             log(f"  试候选面板域名: {candidate}")
             if self._check_panel(candidate):
-                self.panel_url = candidate
                 return True
 
-        log("  候选域名都不可用，改从入口站发现...")
+        log("  其它候选都不可用，走入口站发现（会消耗限流配额）...")
         return self.enter_panel()
 
     def _check_panel(self, url):
@@ -161,6 +197,7 @@ class SkyXClient:
             return False
         if resp.status_code == 200 and "login_form" in resp.text:
             self.panel_url = url
+            self.cache.write(url)
             return True
         log(f"    不可用（{resp.status_code}）")
         return False
@@ -238,13 +275,20 @@ class SkyXClient:
             data={"action": "continue", "nonce": nonce.group(1)},
         )
         if resp.status_code in (429, 403) or not resp.headers.get("Location"):
-            log(f"  落地页: 提交被拒（{resp.status_code}），入口站这条路走不通")
+            if resp.status_code == 429:
+                log("  落地页: continue 被限流（429），本 IP 的入口站配额已用完")
+                log("            —— 面板域名来自入口站，配额用完就拿不到；"
+                    "缓存命中时不会走到这里")
+            else:
+                log(f"  落地页: 提交被拒（{resp.status_code}），入口站这条路走不通")
             return False
 
         location = resp.headers.get("Location")
         panel = urljoin(self.base_url + "/", location).rstrip("/")
         log(f"  面板站（入口站跳转）: {panel}")
-        return self._check_panel(panel)
+        if self._check_panel(panel):
+            return True
+        return False
 
     # ---------- 第 4 步：登录 ----------
     def login(self, email, password, twofa_code=""):
@@ -350,6 +394,7 @@ def main():
     password = os.environ.get("PASSWORD", "")
     base_url = os.environ.get("BASE_URL", DEFAULT_BASE_URL)
     panel_url = os.environ.get("PANEL_URL", "")
+    cache_path = os.environ.get("PANEL_CACHE", DEFAULT_CACHE)
     twofa_code = os.environ.get("TWOFA_CODE", "")
 
     if not email or not password:
@@ -372,28 +417,47 @@ def main():
     log(f"入口站: {base_url}")
     if candidates:
         log(f"面板候选: {', '.join(candidates)}")
+    log(f"面板缓存文件: {cache_path}")
 
-    client = SkyXClient(base_url, panel_url=None, candidates=candidates)
-    try:
-        if not client.resolve_panel():
-            log("无法确定面板站地址")
-            return 1
+    # 入口站 continue 有每 IP 配额，GitHub Actions 的共享 runner IP 常被占满。
+    # 整个流程失败时退避重试，等配额窗口过去还有机会。
+    rounds = int(os.environ.get("MAX_ROUNDS", "3"))
+    for attempt in range(1, rounds + 1):
+        if attempt > 1:
+            wait = min(30 * (2 ** (attempt - 2)), 300)
+            log(f"第 {attempt}/{rounds} 轮重试，{wait}s 后开始")
+            time.sleep(wait)
 
-        ok, _ = client.login(email, password, twofa_code)
-        if not ok:
-            return 1
+        client = SkyXClient(
+            base_url,
+            panel_url=None,
+            candidates=candidates,
+            cache=PanelCache(cache_path),
+        )
+        try:
+            if not client.resolve_panel():
+                log(f"第 {attempt}/{rounds} 轮: 无法确定面板站地址")
+                continue
 
-        result = client.checkin()
-    except requests.RequestException as exc:
-        log(f"网络异常：{exc}")
-        return 1
+            ok, _ = client.login(email, password, twofa_code)
+            if not ok:
+                log(f"第 {attempt}/{rounds} 轮: 登录失败")
+                return 1
 
-    log(f"签到结果: {result.get('msg')}")
-    if result.get("trafficInfo"):
-        log(f"流量信息: {json.dumps(result['trafficInfo'], ensure_ascii=False)}")
+            result = client.checkin()
+        except requests.RequestException as exc:
+            log(f"第 {attempt}/{rounds} 轮: 网络异常 {exc}")
+            continue
 
-    notify(result)
-    return 0 if result.get("ret") == 1 else 1
+        log(f"签到结果: {result.get('msg')}")
+        if result.get("trafficInfo"):
+            log(f"流量信息: {json.dumps(result['trafficInfo'], ensure_ascii=False)}")
+
+        notify(result)
+        return 0 if result.get("ret") == 1 else 1
+
+    log("所有轮次都失败")
+    return 1
 
 
 if __name__ == "__main__":

@@ -181,6 +181,21 @@ def fresh_state():
     )
 
 
+class TempCache:
+    """测试用的假缓存：不落盘。"""
+
+    def __init__(self, value=None):
+        self.value = value
+        self.written = None
+
+    def read(self):
+        return self.value
+
+    def write(self, url):
+        self.value = url
+        self.written = url
+
+
 def load_module():
     import importlib.util
 
@@ -203,7 +218,7 @@ if __name__ == "__main__":
     # ---------- 1) 完整链路：入口站 -> WAF -> 落地页 -> 面板 -> 登录 -> 签到 ----------
     print("\n=== 1) 完整链路（入口站发现面板域名）===")
     fresh_state()
-    client = mod.SkyXClient(entry, candidates=[], retry_sleep=0)
+    client = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=TempCache())
     assert client.resolve_panel() is True, "面板发现失败"
     assert client.panel_url == panel, f"面板地址不对: {client.panel_url}"
     assert STATE["waf_passed"], "WAF 未置位"
@@ -239,14 +254,14 @@ if __name__ == "__main__":
     print("\n=== 3) 入口站 continue 返回 429 ===")
     fresh_state()
     STATE["continue_mode"] = "429"
-    client3 = mod.SkyXClient(entry, candidates=[], retry_sleep=0)
+    client3 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=TempCache())
     assert client3.enter_panel() is False, "429 时不应判定成功"
     print("  断言通过：429 被识别为失败，不会拿空面板地址去登录")
 
     # ---------- 4) cookie 域隔离 ----------
     print("\n=== 4) cookie 域隔离 ===")
     fresh_state()
-    client4 = mod.SkyXClient(entry, candidates=[], retry_sleep=0)
+    client4 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=TempCache())
     client4.resolve_panel()
     assert client4.entry is not client4.panel, "入口站与面板站必须用不同 Session"
     assert client4._session_for(entry + "/") is client4.entry
@@ -258,7 +273,7 @@ if __name__ == "__main__":
     # ---------- 5) 429 退避重试确实会重试 ----------
     print("\n=== 5) 429 退避重试 ===")
     fresh_state()
-    client5 = mod.SkyXClient(entry, candidates=[], retry_sleep=0)
+    client5 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=TempCache())
     calls = {"n": 0}
     orig = client5._request
 
@@ -275,5 +290,31 @@ if __name__ == "__main__":
         pass
     assert calls["n"] > 1, f"429 应触发重试，实际调用 {calls['n']} 次"
     print(f"  断言通过：429 触发了重试（{calls['n']} 次请求）")
+
+    # ---------- 6) 面板域名缓存 ----------
+    print("\n=== 6) 面板域名缓存 ===")
+    fresh_state()
+    cache = TempCache()
+    client6 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=cache)
+    assert client6.resolve_panel() is True, "首次发现失败"
+    assert cache.written == panel, f"未缓存面板地址: {cache.written}"
+    print(f"  断言通过：发现后缓存了 {cache.written}")
+
+    # 第二次运行：缓存命中，不该再碰入口站
+    fresh_state()
+    cache2 = TempCache(value=panel)
+    client7 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=cache2)
+    assert client7.resolve_panel() is True, "缓存命中时解析失败"
+    assert STATE["waf_passed"] is False, "缓存命中时不该走 WAF"
+    assert client7.panel_url == panel
+    print("  断言通过：缓存命中时完全没碰入口站")
+
+    # 缓存失效（域名已死）→ 回落到入口站重新发现
+    fresh_state()
+    cache3 = TempCache(value="http://localhost:1/dead")
+    client8 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=cache3)
+    assert client8.resolve_panel() is True, "缓存失效后应能重新发现"
+    assert cache3.written == panel, f"失效后未更新缓存: {cache3.written}"
+    print("  断言通过：缓存失效后回落入口站并更新缓存")
 
     print("\n全部断言通过")

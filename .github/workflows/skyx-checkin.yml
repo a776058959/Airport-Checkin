@@ -31,6 +31,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      # 面板域名是随机分配的，唯一来源是入口站；而入口站的 continue 接口
+      # 有每 IP 配额，Actions 的共享 runner IP 常常已被占满会返回 429。
+      # 所以把已发现的面板域名缓存下来跨 run 复用，只有缓存失效时才回入口站。
+      - name: Restore panel domain cache
+        id: panel-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .panel-cache
+          key: skyx-panel-${{ github.run_id }}
+          restore-keys: |
+            skyx-panel-
+
       - name: Run checkin
         env:
           SCKEY: ${{ secrets.SCKEY }}
@@ -42,3 +54,11 @@ jobs:
           TGBOT: ${{ secrets.TGBOT }}
           TGUSERID: ${{ secrets.TGUSERID }}
         run: python3 ./skyx-checkin.py
+
+      # 缓存命中与否都要保存：命中时原样保存，未命中时脚本已写入新域名
+      - name: Save panel domain cache
+        if: always() && hashFiles('.panel-cache') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .panel-cache
+          key: skyx-panel-${{ github.run_id }}
