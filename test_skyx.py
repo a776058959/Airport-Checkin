@@ -1,20 +1,27 @@
 """用本地 mock 服务器验证 skyx-checkin.py 的完整分支逻辑。
 
-mock 复刻真实站点的行为：
-  GET 入口站 /                    -> 307 到 /WAF/VERIFY/CAPTCHA?info=...&from=%2F
-  GET 入口站 /WAF/VERIFY/CAPTCHA  -> 200 返回含 GOEDGE_WAF_CAPTCHA_ID 与写死 nonce 的页面
-  POST 入口站 /WAF/VERIFY/CAPTCHA -> 校验两个字段，通过则 303 + 下发 ge_wc_* cookie
-  GET 入口站 /                    -> 200 落地页（form action=continue）
-  POST 入口站 / (action=continue) -> 303 跳到面板域名
-  GET 面板 /auth/login            -> 200 登录页（含 login_form）
-  POST 面板 /auth/login           -> 200 {"ret":..,"msg":..}
-  POST 面板 /user/checkin         -> 200 {"ret":1,"msg":..,"traffic":..}
+脚本是通用的：先探测当前域名是不是面板，不是才走人机验证+跳转。
+mock 复刻两种站点形态：
 
-同时覆盖：
-  - PANEL_URL 直连面板（完全不经入口站）
-  - 入口站 POST continue 返回 429 时的降级
-  - 429 的退避重试
-  - cookie 域隔离
+  跳转型（入口站只是中转）：
+    GET  /                      -> 307 到 /WAF/VERIFY/CAPTCHA
+    GET  /WAF/VERIFY/CAPTCHA    -> 200 含 GOEDGE_WAF_CAPTCHA_ID 与写死 nonce
+    POST /WAF/VERIFY/CAPTCHA    -> 校验两个字段，通过则 303 + 放行 cookie
+    GET  /                      -> 200 落地页（form action=continue）
+    POST / (action=continue)    -> 303 跳到面板域名
+
+  直连型（当前域名就是面板）：
+    GET  /auth/login            -> 200 登录页（含 login_form）
+
+覆盖场景：
+  1. 跳转型完整链路
+  2. 直连型：当前域名直接就是面板，不碰人机验证
+  3. 登录成功/失败分支
+  4. 签到
+  5. 入口站 continue 返回 429 时正确失败
+  6. cookie 域隔离
+  7. 429 退避重试
+  8. 面板地址缓存（写入 / 命中 / 失效后回落）
 """
 
 import json
@@ -49,7 +56,10 @@ STATE = {
     "waf_passed": False,
     "logged_in": False,
     "continue_mode": "ok",  # ok | 429
-    "rate_limit_once": False,
+    # 直连型：当前域名自己就是面板
+    "direct_panel": False,
+    # Cloudflare 挑战
+    "cloudflare": False,
 }
 
 
@@ -69,10 +79,28 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         host = self.headers.get("Host", "")
-        panel = "localhost" in host
+        on_panel = "localhost" in host
 
-        if panel:
+        if on_panel:
             if path.endswith("/auth/login"):
+                self._send(200, LOGIN_HTML.encode(), {"Content-Type": "text/html"})
+            else:
+                self._send(404, b"not found")
+            return
+
+        if STATE["cloudflare"]:
+            self._send(
+                403,
+                b'<!DOCTYPE html><html><head><title>Just a moment...</title></head>'
+                b'<body><script src="/cdn-cgi/challenge-platform/x"></script></body></html>',
+                {"Content-Type": "text/html", "Server": "cloudflare",
+                 "cf-mitigated": "challenge"},
+            )
+            return
+
+        # 入口站
+        if STATE["direct_panel"]:
+            if path == "/auth/login":
                 self._send(200, LOGIN_HTML.encode(), {"Content-Type": "text/html"})
             else:
                 self._send(404, b"not found")
@@ -96,19 +124,12 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length).decode() if length else ""
         path = urlparse(self.path).path
         host = self.headers.get("Host", "")
-        panel = "localhost" in host
+        on_panel = "localhost" in host
         fields = parse_qs(body)
 
-        if panel:
+        if on_panel or STATE["direct_panel"]:
             if path.endswith("/auth/login"):
                 if fields.get("passwd", [""])[0] == "goodpass":
-                    STATE["logged_in"] = True
-                    self._send(
-                        200,
-                        json.dumps({"ret": 1, "msg": "登录成功"}).encode(),
-                        {"Content-Type": "application/json"},
-                    )
-                elif fields.get("code", [""])[0] == "123456":
                     STATE["logged_in"] = True
                     self._send(
                         200,
@@ -176,7 +197,8 @@ def fresh_state():
             "waf_passed": False,
             "logged_in": False,
             "continue_mode": "ok",
-            "rate_limit_once": False,
+            "direct_panel": False,
+            "cloudflare": False,
         }
     )
 
@@ -215,15 +237,23 @@ if __name__ == "__main__":
     entry = f"http://127.0.0.1:{PORT}"
     panel = f"http://localhost:{PORT}/panel"
 
-    # ---------- 1) 完整链路：入口站 -> WAF -> 落地页 -> 面板 -> 登录 -> 签到 ----------
-    print("\n=== 1) 完整链路（入口站发现面板域名）===")
+    def make(base=None, candidates=None, cache=None):
+        return mod.CheckinClient(
+            base or entry,
+            candidates=candidates if candidates is not None else [],
+            retry_sleep=0,
+            cache=cache if cache is not None else TempCache(),
+        )
+
+    # ---------- 1) 跳转型：入口站发现面板 ----------
+    print("\n=== 1) 跳转型完整链路 ===")
     fresh_state()
-    client = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=TempCache())
+    client = make()
     assert client.resolve_panel() is True, "面板发现失败"
     assert client.panel_url == panel, f"面板地址不对: {client.panel_url}"
     assert STATE["waf_passed"], "WAF 未置位"
-    assert "ge_wc_91" in client.entry.cookies.get_dict(), "入口站未拿到 WAF cookie"
-    print("  断言通过：WAF 通过 + 落地页跳转到面板")
+    assert "ge_wc_91" in client.entry.cookies.get_dict(), "入口站未拿到放行 cookie"
+    print("  断言通过：过 WAF -> 落地页 -> 跳到面板")
 
     ok, msg = client.login("a@b.com", "wrongpass")
     assert ok is False and msg == "密码错误", f"登录失败分支不对: {ok}, {msg}"
@@ -237,31 +267,32 @@ if __name__ == "__main__":
     assert result.get("ret") == 1 and result.get("traffic") == "10.02GB", f"签到结果不对: {result}"
     print("  断言通过：签到返回 ret=1 与 traffic")
 
-    # ---------- 2) PANEL_URL 直连面板，不碰入口站 ----------
-    print("\n=== 2) PANEL_URL 直连面板（跳过入口站）===")
+    # ---------- 2) 直连型：当前域名就是面板 ----------
+    print("\n=== 2) 直连型（当前域名直接是面板，不碰人机验证）===")
     fresh_state()
-    client2 = mod.SkyXClient(entry, panel_url=panel)
-    assert client2.resolve_panel() is True, "直连面板失败"
-    assert STATE["waf_passed"] is False, "直连面板不该碰 WAF"
-    assert client2.panel_url == panel
+    STATE["direct_panel"] = True
+    client2 = make()
+    assert client2.resolve_panel() is True, "直连模式解析失败"
+    assert client2.panel_url == entry, f"应直接用当前域名: {client2.panel_url}"
+    assert STATE["waf_passed"] is False, "直连模式不该走 WAF"
     ok, _ = client2.login("a@b.com", "goodpass")
-    assert ok is True, "直连模式下登录失败"
+    assert ok is True, "直连模式登录失败"
     result = client2.checkin()
     assert result.get("ret") == 1, f"直连模式签到失败: {result}"
-    print("  断言通过：全程未经过入口站，登录与签到均成功")
+    print("  断言通过：全程未经过人机验证，登录与签到均成功")
 
-    # ---------- 3) 入口站 continue 返回 429 时应失败而不是拿空地址 ----------
+    # ---------- 3) 入口站 continue 返回 429 ----------
     print("\n=== 3) 入口站 continue 返回 429 ===")
     fresh_state()
     STATE["continue_mode"] = "429"
-    client3 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=TempCache())
-    assert client3.enter_panel() is False, "429 时不应判定成功"
-    print("  断言通过：429 被识别为失败，不会拿空面板地址去登录")
+    client3 = make()
+    assert client3.resolve_panel() is False, "429 时不应判定成功"
+    print("  断言通过：429 被识别为失败，不会拿空地址去登录")
 
     # ---------- 4) cookie 域隔离 ----------
     print("\n=== 4) cookie 域隔离 ===")
     fresh_state()
-    client4 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=TempCache())
+    client4 = make()
     client4.resolve_panel()
     assert client4.entry is not client4.panel, "入口站与面板站必须用不同 Session"
     assert client4._session_for(entry + "/") is client4.entry
@@ -270,10 +301,10 @@ if __name__ == "__main__":
     print(f"  panel cookies : {sorted(client4.panel.cookies.get_dict())}")
     print("  断言通过：按域名选对了 Session")
 
-    # ---------- 5) 429 退避重试确实会重试 ----------
+    # ---------- 5) 429 退避重试 ----------
     print("\n=== 5) 429 退避重试 ===")
     fresh_state()
-    client5 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=TempCache())
+    client5 = make()
     calls = {"n": 0}
     orig = client5._request
 
@@ -283,38 +314,43 @@ if __name__ == "__main__":
 
     client5._request = counting
     STATE["continue_mode"] = "429"
-    # enter_panel 内部会 POST continue，遇到 429 会重试；这里只验证会重试
     try:
-        client5.enter_panel()
+        client5.resolve_panel()
     except Exception:
         pass
     assert calls["n"] > 1, f"429 应触发重试，实际调用 {calls['n']} 次"
     print(f"  断言通过：429 触发了重试（{calls['n']} 次请求）")
 
-    # ---------- 6) 面板域名缓存 ----------
-    print("\n=== 6) 面板域名缓存 ===")
+    # ---------- 6) 面板地址缓存 ----------
+    print("\n=== 6) 面板地址缓存 ===")
     fresh_state()
     cache = TempCache()
-    client6 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=cache)
+    client6 = make(cache=cache)
     assert client6.resolve_panel() is True, "首次发现失败"
     assert cache.written == panel, f"未缓存面板地址: {cache.written}"
     print(f"  断言通过：发现后缓存了 {cache.written}")
 
-    # 第二次运行：缓存命中，不该再碰入口站
     fresh_state()
     cache2 = TempCache(value=panel)
-    client7 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=cache2)
+    client7 = make(cache=cache2)
     assert client7.resolve_panel() is True, "缓存命中时解析失败"
     assert STATE["waf_passed"] is False, "缓存命中时不该走 WAF"
     assert client7.panel_url == panel
     print("  断言通过：缓存命中时完全没碰入口站")
 
-    # 缓存失效（域名已死）→ 回落到入口站重新发现
     fresh_state()
     cache3 = TempCache(value="http://localhost:1/dead")
-    client8 = mod.SkyXClient(entry, candidates=[], retry_sleep=0, cache=cache3)
+    client8 = make(cache=cache3)
     assert client8.resolve_panel() is True, "缓存失效后应能重新发现"
     assert cache3.written == panel, f"失效后未更新缓存: {cache3.written}"
     print("  断言通过：缓存失效后回落入口站并更新缓存")
+
+    # ---------- 7) Cloudflare 挑战应被识别并明确报错 ----------
+    print("\n=== 7) Cloudflare 挑战识别 ===")
+    fresh_state()
+    STATE["cloudflare"] = True
+    client9 = make()
+    assert client9.resolve_panel() is False, "Cloudflare 挑战时不应判定成功"
+    print("  断言通过：识别出 Cloudflare 挑战并明确失败")
 
     print("\n全部断言通过")

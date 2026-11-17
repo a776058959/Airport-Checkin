@@ -1,41 +1,32 @@
 #!/usr/bin/env python3
-"""SKY VPN (skyxcloud.cc / skyvpn.bond) 自动签到。
+"""机场面板自动签到（通用版）。
 
-站点结构（2026-11 实测）：
+不同机场站的入口结构不一样，本脚本不写死任何一家，而是**先探测、再决定走哪条路**：
 
-    https://www.skyxcloud.cc/            入口站，GoEdge WAF 保护
-      └─ 307 → /WAF/VERIFY/CAPTCHA      GoEdge 滑动验证码（弱校验）
-      └─ 落地页 form(action=continue, nonce)
-      └─ 303 → https://<panel>.skyvpn.bond   真正的 SSPANEL 面板
-           └─ POST /auth/login           返回 {ret, msg}
-           └─ POST /user/checkin         返回 {ret, msg, traffic, trafficInfo}
+    A. 直连型：域名本身就是面板，过完人机验证直接就能登录签到
+       例：https://www.skyvpnx.com/
+    B. 跳转型：入口站只是个中转，过验证后要提交表单跳到另一个域名
+       例：https://www.skyxcloud.cc/ → https://<随机域名>.skyvpn.bond/
 
-三条关键事实（决定了本脚本的结构）：
+所以脚本对每个站点都按同样的顺序尝试，区别只在于「当前域名能不能直接登录」：
 
-1. **GoEdge WAF 的滑动验证码是弱校验**：页面里只有 `GOEDGE_WAF_CAPTCHA_ID`
-   隐藏字段与写死在 JS 里的 `nonce`，服务端只比对这两个值，不做轨迹校验。
-   因此纯 requests 就能过，不需要浏览器自动化。
+    1. 显式配置的 PANEL_URL
+    2. 上次缓存的面板域名
+    3. 当前 BASE_URL 本身（探测它是否直接就是面板）
+    4. 过人机验证 + 跟随跳转/提交表单，拿到真正的面板地址
 
-2. **面板域名是随机分配的**（形如 `q210ycweb.skyvpn.bond`、`subb3xq6b.skyvpn.bond`），
-   唯一获取途径是入口站落地页的 continue 表单。
-
-3. **入口站 continue 有每 IP 配额**：实测连续调 3 次，第 3 次起返回 429，
-   且 429 会连带影响后续落地页访问。GitHub Actions 的 runner IP 共享且常被
-   占满，所以不能每次都走入口站。
-
-对策是**缓存面板域名**：本地缓存文件（Actions 用 actions/cache 跨 run 持久化）
-存下已发现的域名，下次直接用；只有缓存失效时才回入口站重新发现。
-
-用法：
-    EMAIL=... PASSWORD=... python3 skyx-checkin.py
+人机验证只处理 GoEdge WAF 的滑动验证码：页面里只有 `GOEDGE_WAF_CAPTCHA_ID`
+隐藏字段与写死在 JS 里的 `nonce`，服务端只比对这两个值、不做轨迹校验，
+所以纯 requests 就能过，不需要浏览器自动化。
 
 环境变量：
     EMAIL       登录邮箱（必需）
     PASSWORD    登录密码（必需）
-    PANEL_URL   面板站地址（可选，多个候选用逗号分隔；优先于缓存）
-    PANEL_CACHE 面板域名缓存文件路径，默认 .panel-cache
-    BASE_URL    入口站地址，默认 https://www.skyxcloud.cc
+    BASE_URL    站点地址，默认 https://www.skyxcloud.cc
+    PANEL_URL   面板地址（可选，多个候选用逗号分隔）
+    PANEL_CACHE 面板域名缓存文件，默认 .panel-cache
     TWOFA_CODE  两步验证码（账户开了两步验证时必需）
+    MAX_ROUNDS  整体重试轮数，默认 3
     SCKEY       Server酱 key，可选
     TGBOT       Telegram bot token，可选
     TGUSERID    Telegram chat id，可选
@@ -58,20 +49,38 @@ UA = (
 DEFAULT_BASE_URL = "https://www.skyxcloud.cc"
 DEFAULT_CACHE = ".panel-cache"
 
+# 人机验证页里提取这两个值即可通过 GoEdge WAF 滑动验证码
+RE_CAPTCHA_ID = re.compile(r'name="GOEDGE_WAF_CAPTCHA_ID"\s+value="([^"]+)"')
+RE_NONCE = re.compile(r'setAttribute\("value","(\d+)"\)')
+# 落地页跳转表单里的 nonce
+RE_PAGE_NONCE = re.compile(r'name="nonce"\s+value="([^"]+)"')
+
 
 def log(msg):
     print(msg, flush=True)
 
 
 class PanelCache:
-    """面板域名缓存。存下已发现的域名，避免每次都去撞入口站的限流配额。"""
+    """面板地址缓存。存下已发现的域名，避免每次都去撞入口站的限流配额。
 
-    def __init__(self, path=DEFAULT_CACHE):
-        self.path = path
+    **按站点分文件**：不同站点的面板地址互不相干，共用一个文件会串。
+    `path` 当作目录用（默认 `.panel-cache`），里面按站点主机名分文件。
+    """
+
+    def __init__(self, path=DEFAULT_CACHE, site=None):
+        self.dir = path
+        self.site = site
+
+    def _file(self):
+        """缓存文件路径。给了 site 就按站点分开存。"""
+        if not self.site:
+            return self.dir
+        safe = re.sub(r"[^A-Za-z0-9.-]+", "_", self.site)
+        return os.path.join(self.dir, safe)
 
     def read(self):
         try:
-            with open(self.path, encoding="utf-8") as fh:
+            with open(self._file(), encoding="utf-8") as fh:
                 data = fh.read().strip()
             return data if data.startswith("http") else None
         except OSError:
@@ -79,18 +88,19 @@ class PanelCache:
 
     def write(self, url):
         try:
-            with open(self.path, "w", encoding="utf-8") as fh:
+            os.makedirs(self.dir, exist_ok=True)
+            with open(self._file(), "w", encoding="utf-8") as fh:
                 fh.write(url)
-            log(f"  已缓存面板域名 -> {self.path}")
+            log(f"  已缓存面板地址 -> {self._file()}")
         except OSError as exc:
             log(f"  缓存写入失败（不影响本次签到）：{exc}")
 
 
-class SkyXClient:
-    """按 面板站 -> 登录 -> 签到 的顺序跑链路。
+class CheckinClient:
+    """一个站点的签到客户端。
 
-    入口站与面板站是两个不同域名，各用一个 Session，cookie 不互相污染
-    （否则面板站会收到入口站的 PHPSESSID）。
+    站点可以是「直连型」（当前域名就是面板）或「跳转型」（要过验证再跳）。
+    两种都用同一套流程：探测当前域名能否直接登录，不能就过验证拿跳转目标。
     """
 
     def __init__(self, base_url=DEFAULT_BASE_URL, panel_url=None, timeout=40,
@@ -104,6 +114,8 @@ class SkyXClient:
         # 退避基数，测试里可以调小
         self.retry_sleep = retry_sleep if retry_sleep is not None else 3
         self.cache = cache if cache is not None else PanelCache()
+        # 过验证后拿到的跳转目标，等真正确认它是面板后才算
+        self._pending = None
 
     @staticmethod
     def _new_session():
@@ -155,79 +167,102 @@ class SkyXClient:
             return last
         raise last
 
-    # ---------- 第 1 步：确定面板站地址 ----------
-    def resolve_panel(self):
-        """确定面板站地址。
-
-        面板域名随机分配，唯一来源是入口站，但入口站 continue 有每 IP 配额，
-        所以按「稳 → 不稳」排序，逐个尝试：
-
-          1. 显式配置的 PANEL_URL
-          2. 上次缓存的域名（存在缓存文件里）
-          3. 其它候选域名
-          4. 入口站落地页跳转（消耗配额，最后手段）
-        """
-        if self.panel_url:
-            log(f"  面板站（配置）: {self.panel_url}")
-            if self._check_panel(self.panel_url):
-                return True
-            log("  配置的面板地址不可用，继续找别的")
-
-        cached = self.cache.read()
-        if cached:
-            log(f"  面板站（缓存）: {cached}")
-            if self._check_panel(cached):
-                return True
-            log("  缓存的面板地址已失效，重新发现")
-
-        for candidate in self.candidates:
-            log(f"  试候选面板域名: {candidate}")
-            if self._check_panel(candidate):
-                return True
-
-        log("  其它候选都不可用，走入口站发现（会消耗限流配额）...")
-        return self.enter_panel()
-
-    def _check_panel(self, url):
-        """探活：面板站 /auth/login 能出登录表单就算可用。"""
+    # ---------- 面板地址探测 ----------
+    def _looks_like_panel(self, url):
+        """探测某个地址是不是面板：/auth/login 能出登录表单就算。"""
         try:
-            resp = self._request("GET", url + "/auth/login", "GET panel")
+            resp = self._request("GET", url + "/auth/login", "GET login")
         except requests.RequestException as exc:
-            log(f"    不可用：{exc}")
+            log(f"    {url} 不可用：{exc}")
             return False
         if resp.status_code == 200 and "login_form" in resp.text:
-            self.panel_url = url
-            self.cache.write(url)
             return True
-        log(f"    不可用（{resp.status_code}）")
+        log(f"    {url} 不是面板（{resp.status_code}）")
         return False
 
-    # ---------- 第 2 步：过 GoEdge WAF 滑动验证码 ----------
-    def pass_waf(self):
-        """访问入口站，必要时通过 WAF 滑动验证码。
+    def _adopt(self, url):
+        """确认某地址是面板，设为当前面板并缓存。"""
+        self.panel_url = url.rstrip("/")
+        self.cache.write(self.panel_url)
+        return True
 
-        滑动验证码页面里有两个值：
-          - GOEDGE_WAF_CAPTCHA_ID：隐藏表单字段
-          - nonce：页面 JS 写死的数字
-        把它们 POST 回验证地址，服务端就发放 ge_wc_* cookie。
+    # ---------- 第 1 步：确定面板地址 ----------
+    def resolve_panel(self):
+        """确定面板地址，按「稳 → 不稳」逐个尝试。
+
+        直连型站点在这里第 3 步就命中；跳转型站点要走到第 4 步。
+        """
+        # 1. 显式配置
+        if self.panel_url:
+            log(f"  面板地址（配置）: {self.panel_url}")
+            if self._looks_like_panel(self.panel_url):
+                return self._adopt(self.panel_url)
+            log("  配置的地址不可用，继续找别的")
+
+        # 2. 上次缓存的
+        cached = self.cache.read()
+        if cached:
+            log(f"  面板地址（缓存）: {cached}")
+            if self._looks_like_panel(cached):
+                return self._adopt(cached)
+            log("  缓存的地址已失效，重新发现")
+
+        # 3. 当前域名本身（直连型站点走这里）
+        log(f"  探测当前域名是否直接是面板: {self.base_url}")
+        if self._looks_like_panel(self.base_url):
+            return self._adopt(self.base_url)
+
+        # 4. 其它候选
+        for candidate in self.candidates:
+            log(f"  试候选面板地址: {candidate}")
+            if self._looks_like_panel(candidate):
+                return self._adopt(candidate)
+
+        # 5. 过人机验证 + 跟随跳转（跳转型站点走这里）
+        log("  走人机验证与跳转流程...")
+        return self.discover_via_waf()
+
+    # ---------- 第 2 步：过人机验证 ----------
+    def pass_waf(self):
+        """访问站点，必要时通过人机验证。
+
+        支持两类：
+
+        - **GoEdge WAF 滑动验证码**：页面里只有 `GOEDGE_WAF_CAPTCHA_ID` 隐藏字段
+          与写死在 JS 里的 `nonce`，服务端只比对这两个值、不做轨迹校验，
+          所以纯 requests 就能过。
+
+        - **Cloudflare 挑战**（Turnstile 等）：服务端会校验浏览器指纹与
+          JS 计算结果，纯 HTTP 过不了。这种情况脚本会明确报出来，
+          需要改用真实浏览器（见仓库里的 DS-beta.py 思路）。
         """
         for _ in range(5):
             resp = self._request("GET", self.base_url + "/", "GET /")
+
+            # Cloudflare 挑战：识别出来就直接说明，不浪费后续尝试
+            if self._is_cloudflare_challenge(resp):
+                log("  人机验证: 遇到 Cloudflare 挑战（需真实浏览器，纯 HTTP 过不了）")
+                log("            可以改用 PANEL_URL 指向已通过验证的面板地址")
+                return False
+
             location = resp.headers.get("Location")
             if not location:
-                log("  WAF: 直接放行")
+                log("  人机验证: 直接放行")
                 return True
 
-            log(f"  WAF: 需要滑动验证 -> {location[:70]}")
+            # 其它站点可能用别的跳转路径，只要 Location 里有验证码特征就继续处理
+            if "captcha" not in location.lower() and "verify" not in location.lower():
+                log(f"  人机验证: 未知跳转 {location[:70]}")
+                return False
+
+            log(f"  人机验证: 需要滑动验证 -> {location[:70]}")
             captcha_url = urljoin(self.base_url + "/", location)
             page = self._request("GET", captcha_url, "GET captcha").text
 
-            captcha_id = re.search(
-                r'name="GOEDGE_WAF_CAPTCHA_ID"\s+value="([^"]+)"', page
-            )
-            nonce = re.search(r'setAttribute\("value","(\d+)"\)', page)
+            captcha_id = RE_CAPTCHA_ID.search(page)
+            nonce = RE_NONCE.search(page)
             if not captcha_id or not nonce:
-                log("  WAF: 页面结构变了，无法解析验证参数")
+                log("  人机验证: 页面结构变了，无法解析验证参数")
                 return False
 
             resp = self._request(
@@ -245,22 +280,51 @@ class SkyXClient:
                 },
             )
             if resp.status_code in (302, 303):
-                log("  WAF: 滑动验证通过")
+                log("  人机验证: 滑动验证通过")
                 return True
-            log(f"  WAF: 验证未通过（{resp.status_code}），重试")
+            log(f"  人机验证: 未通过（{resp.status_code}），重试")
         return False
 
-    # ---------- 第 3 步：落地页 -> 面板站 ----------
-    def enter_panel(self):
-        """入口站落地页有个 continue 表单，提交后 303 到真正的面板域名。"""
+    @staticmethod
+    def _is_cloudflare_challenge(resp):
+        """判断响应是不是 Cloudflare 的人机挑战。"""
+        if resp.headers.get("cf-mitigated") == "challenge":
+            return True
+        server = (resp.headers.get("server") or "").lower()
+        if "cloudflare" in server and resp.status_code in (403, 503):
+            return True
+        try:
+            body = resp.text[:4000].lower()
+        except Exception:
+            return False
+        return "just a moment" in body or "cf_chl_opt" in body or "challenge-platform" in body
+
+    # ---------- 第 3 步：过验证后找面板 ----------
+    def discover_via_waf(self):
+        """过完人机验证后，找出真正的面板地址。
+
+        两种可能：
+          - 响应里直接 302/303 跳到别的域名 → 那是面板
+          - 停在落地页，有个 continue 表单 → 提交后跳到面板
+        """
         if not self.pass_waf():
-            log("  入口站: WAF 未通过")
+            log("  人机验证未通过")
             return False
 
-        page = self._request("GET", self.base_url + "/", "GET landing").text
-        nonce = re.search(r'name="nonce"\s+value="([^"]+)"', page)
+        # 先看有没有直接跳转
+        resp = self._request("GET", self.base_url + "/", "GET landing")
+        location = resp.headers.get("Location")
+        if location and resp.status_code in (301, 302, 303, 307):
+            target = urljoin(self.base_url + "/", location).rstrip("/")
+            log(f"  跳转目标: {target}")
+            if self._looks_like_panel(target):
+                return self._adopt(target)
+            log("  跳转目标不是面板")
+
+        # 落地页的 continue 表单
+        nonce = RE_PAGE_NONCE.search(resp.text)
         if not nonce:
-            log("  落地页: 没找到 nonce")
+            log("  落地页: 没找到 nonce，也没找到跳转")
             return False
 
         resp = self._request(
@@ -274,23 +338,22 @@ class SkyXClient:
             },
             data={"action": "continue", "nonce": nonce.group(1)},
         )
-        if resp.status_code in (429, 403) or not resp.headers.get("Location"):
-            if resp.status_code == 429:
-                log("  落地页: continue 被限流（429），本 IP 的入口站配额已用完")
-                log("            —— 面板域名来自入口站，配额用完就拿不到；"
-                    "缓存命中时不会走到这里")
-            else:
-                log(f"  落地页: 提交被拒（{resp.status_code}），入口站这条路走不通")
+        if resp.status_code == 429:
+            log("  落地页: continue 被限流（429），本 IP 的配额已用完")
+            log("            —— 面板地址来自这里，配额用完就拿不到；"
+                "缓存命中时不会走到这里")
+            return False
+        if not resp.headers.get("Location"):
+            log(f"  落地页: 提交被拒（{resp.status_code}）")
             return False
 
-        location = resp.headers.get("Location")
-        panel = urljoin(self.base_url + "/", location).rstrip("/")
-        log(f"  面板站（入口站跳转）: {panel}")
-        if self._check_panel(panel):
-            return True
+        target = urljoin(self.base_url + "/", resp.headers["Location"]).rstrip("/")
+        log(f"  面板地址（表单跳转）: {target}")
+        if self._looks_like_panel(target):
+            return self._adopt(target)
         return False
 
-    # ---------- 第 4 步：登录 ----------
+    # ---------- 登录 ----------
     def login(self, email, password, twofa_code=""):
         url = self.panel_url + "/auth/login"
         resp = self._request(
@@ -328,7 +391,7 @@ class SkyXClient:
         log(f"  登录: 失败（{msg or resp.status_code}）")
         return False, msg
 
-    # ---------- 第 5 步：签到 ----------
+    # ---------- 签到 ----------
     def checkin(self):
         url = self.panel_url + "/user/checkin"
         resp = self._request(
@@ -396,6 +459,7 @@ def main():
     panel_url = os.environ.get("PANEL_URL", "")
     cache_path = os.environ.get("PANEL_CACHE", DEFAULT_CACHE)
     twofa_code = os.environ.get("TWOFA_CODE", "")
+    rounds = int(os.environ.get("MAX_ROUNDS", "3"))
 
     if not email or not password:
         log("必须设置 EMAIL 与 PASSWORD 环境变量")
@@ -404,7 +468,6 @@ def main():
     if not base_url.startswith(("http://", "https://")):
         base_url = "https://" + base_url
 
-    # PANEL_URL 可以给多个候选（逗号分隔），按顺序探活
     candidates = []
     for raw in panel_url.split(","):
         u = raw.strip()
@@ -414,29 +477,28 @@ def main():
             u = "https://" + u
         candidates.append(u.rstrip("/"))
 
-    log(f"入口站: {base_url}")
+    log(f"站点: {base_url}")
     if candidates:
         log(f"面板候选: {', '.join(candidates)}")
     log(f"面板缓存文件: {cache_path}")
 
-    # 入口站 continue 有每 IP 配额，GitHub Actions 的共享 runner IP 常被占满。
+    # 入口站的 continue 有每 IP 配额，GitHub Actions 的共享 runner IP 常被占满。
     # 整个流程失败时退避重试，等配额窗口过去还有机会。
-    rounds = int(os.environ.get("MAX_ROUNDS", "3"))
     for attempt in range(1, rounds + 1):
         if attempt > 1:
             wait = min(30 * (2 ** (attempt - 2)), 300)
             log(f"第 {attempt}/{rounds} 轮重试，{wait}s 后开始")
             time.sleep(wait)
 
-        client = SkyXClient(
+        client = CheckinClient(
             base_url,
             panel_url=None,
             candidates=candidates,
-            cache=PanelCache(cache_path),
+            cache=PanelCache(cache_path, site=urlparse(base_url).hostname or base_url),
         )
         try:
             if not client.resolve_panel():
-                log(f"第 {attempt}/{rounds} 轮: 无法确定面板站地址")
+                log(f"第 {attempt}/{rounds} 轮: 找不到可用的面板地址")
                 continue
 
             ok, _ = client.login(email, password, twofa_code)
