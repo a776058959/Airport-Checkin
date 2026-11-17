@@ -127,3 +127,32 @@ TLS1.2 无证书 -> ssl/tls alert bad certificate
 - `client-recon/findings.json` — 结构化事实（已脱敏）
 - `_skyx/lib/SkyVpn.Core.dll` — 核心程序集 3.4 MB（临时目录）
 - `_skyx/lib/SkyVpn.SetupPayload.dll` — 安装载荷 66 MB（临时目录）
+
+---
+
+## 八、追加验证（2026-11-18 02:xx，完整权限下）
+
+用户提出「能不能直接用它的证书」后做了穷尽式排查，结论是**本机拿不到**：
+
+| 位置 | 结果 |
+| --- | --- |
+| `C:\Program Files\SKY VPN\` 全目录 | 无 .pfx/.p12/.pem/.crt |
+| `SkyVPN.exe`（73MB）全文 | 无 PKCS12 DER；`assets/certs/skyvpn-client.pfx.enc` 仅作为字符串出现 |
+| `SkyVpn.Core.dll`（3.4MB，已从 bundle 解出） | PKCS12 DER 命中 **0**；证书名只在 #Strings 堆 |
+| `SkyVpn.SetupPayload.dll`（66MB，已解压） | 无 pfx 字符串 |
+| 进程内存（PID 16656 UI 进程，541MB） | 59 个 PKCS12，**全部**是 Microsoft 时间戳证书（exe 数字签名的证书链） |
+| 进程内存（PID 972 service 进程，149MB） | 32 个 PKCS12，同样全是 Microsoft 时间戳 |
+| 系统证书存储（CurrentUser\My / LocalMachine\My） | 无 skyvpn 相关 |
+| 磁盘全盘（AppData / ProgramData） | 无 .pfx/.p12/.pem 命中 |
+
+**结论：证书（`.pfx.enc`）是运行时从服务端下载的加密 blob，解密密钥在 .NET 10 程序内部。**
+
+要拿到它必须：装 .NET 10 SDK → ilspycmd 反编译 `SkyVpn.Core.dll` → 定位 `PanelClient.DownloadAsync` 的下载地址 → 还原 `.enc` 解密逻辑（`ProtectedData` + 可能 AES）→ 得到 pfx 密码。
+
+**这仍是本机可做的**，但需要 .NET 10 SDK（本机只有 .NET 8 运行时）。
+
+### 关键教训（工具层）
+
+- PowerShell 脚本**不能用中文**：本机 PowerShell 5.1 读 UTF-8 无 BOM 的 .ps1 会按 GBK 解码，中文变乱码导致字符串未闭合语法错误。所有 .ps1 必须纯英文。
+- Windows PowerShell 5.1 基于 .NET Framework，**加载不了 .NET 10 程序集**（`0x80131515 Operation is not supported`），反射调用这条路需要 PowerShell 7+。
+- 进程内存扫描用 `VirtualQueryEx` + `ReadProcessMemory` 遍历 `MEM_COMMIT` 且可读（0x02/0x04/0x08/0x20/0x40）区域有效，能抓到 91 个证书但对目标无用。

@@ -4,3 +4,4 @@ __pycache__/
 .panel-cache*
 state/
 client-recon/lib/
+_skyx/
