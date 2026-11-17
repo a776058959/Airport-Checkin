@@ -32,24 +32,23 @@ jobs:
       # 恢复两个东西：
       #   .panel-cache —— 面板地址（避免每次都撞入口站限流）
       #   state/       —— 记录今天是否已签到成功
+      #
+      # key 用固定值 + 日期，restore-keys 前缀匹配拿最近一次：
+      # 用 run_id 当 key 会每次产生新条目，缓存永远命中不了旧内容。
       - name: Restore cache
         uses: actions/cache/restore@v4
         with:
           path: |
             .panel-cache
             state
-          key: skyx-${{ github.run_id }}
+          key: skyx-state-v2-${{ github.run_id }}
           restore-keys: |
-            skyx-
+            skyx-state-v2-
 
-      # 决定这次要不要真的签到
       # 决定这次要不要真的签到。
       #
       # 不用 github.event.schedule 匹配 cron 字符串（格式细节不可靠），
       # 直接看当前 UTC 小时落在哪个时间段——比字符串匹配稳。
-      #   16 点 -> 第 1 个（北京 00:10，40% 概率跑）
-      #   18 点 -> 第 2 个（北京 02:10，50% 概率跑）
-      #   其它 -> 第 3 个（北京 04:10，保底必跑）
       - name: Decide whether to run
         id: decide
         env:
@@ -64,6 +63,7 @@ jobs:
           echo "触发方式：$EVENT_NAME"
           echo "当前 UTC 小时：$HOUR"
           echo "上次成功：${LAST:-（无记录）}"
+          echo "面板缓存：$(cat .panel-cache/* 2>/dev/null || echo '（无）')"
 
           # 手动触发：无条件执行（方便调试）
           if [ "$EVENT_NAME" != "schedule" ]; then
@@ -81,13 +81,11 @@ jobs:
 
           # 按 UTC 小时决定策略
           case "$HOUR" in
-            16) P=40; SLOT="第 1 个（北京 00:xx）" ;;
-            17) P=40; SLOT="第 1 个（延迟到 01:xx）" ;;
-            18) P=50; SLOT="第 2 个（北京 02:xx）" ;;
-            19) P=50; SLOT="第 2 个（延迟到 03:xx）" ;;
+            16|17) P=40; SLOT="第 1 个（北京 00-01 点）" ;;
+            18|19) P=50; SLOT="第 2 个（北京 02-03 点）" ;;
             *)
               echo "run=yes" >> "$GITHUB_OUTPUT"
-              echo "→ 第 3 个（北京 04:xx 及以后）保底，必定执行"
+              echo "→ 第 3 个（北京 04 点及以后）保底，必定执行"
               exit 0
               ;;
           esac
@@ -137,9 +135,9 @@ jobs:
           path: |
             .panel-cache
             state
-          key: skyx-${{ github.run_id }}
+          key: skyx-state-v2-${{ github.run_id }}
 
-      # 签到失败且这是最后一个时间点时，让 job 标红，方便你发现
+      # 签到失败时让 job 标红，方便你发现
       - name: Fail if checkin failed
         if: steps.decide.outputs.run == 'yes' && steps.checkin.outcome != 'success'
         run: |
