@@ -1,0 +1,31 @@
+{
+  "settings.json": {
+    "DeviceUid": "2e958235-****",
+    "ProxyMode": "rule",
+    "ConnectionMethod": "system-proxy",
+    "SelectedLine": "",
+    "LastAccount": "776***@qq.com",
+    "CheckedInOn": "2026-11-18",
+    "ReadNotices": [],
+    "AutoConnect": false,
+    "ReconnectAfterUpdate": false,
+    "AutoTestOnLoad": true,
+    "CloseToTray": true,
+    "WindowWidth": 980,
+    "WindowHeight": 660
+  },
+  "_notes": [
+    "SkyVPN.exe = .NET 10 single-file (NETCoreApp v10.0 win-x64), Avalonia 11.3.23 + SkiaSharp",
+    "assemblies: SkyVpn.Core 0.6.5 (3.4MB), SkyVpn.SetupPayload 0.6.5 (66MB, installer payload)",
+    "core/mihomo.exe 61MB = Clash Meta kernel",
+    "Bundle manifest at EOF: Offset(8) Size(8) CompressedSize(8) Type(1) PathLen(1) Path; deflate raw(-15)",
+    "SkyVpn.Core.dll extracted at 0x2e68969 size 3397632",
+    "API base: https://client.skyvpn.bond -> 163.52.242.61 (SAME IP as panel)",
+    "PanelApi methods: SignInAsync(/auth/login), BootstrapAsync, ActionAsync(/user/checkin), ProfileAsync, ClashProfileAsync, WalletAsync, TicketsAsync, ...",
+    "BLOCKER: client.skyvpn.bond enforces mTLS - needs client cert, TLS1.3 certificate required / TLS1.2 bad certificate",
+    "client cert path: assets/certs/skyvpn-client.pfx.enc - NOT in exe, NOT in SetupPayload -> downloaded at runtime",
+    "session.dat = DPAPI encrypted (machine+user bound) -> cannot run on GitHub Actions",
+    "CheckedInOn in settings.json is LOCAL-only; client never queries server checkin status",
+    "VERDICT: client path not portable to CI; web flow already works with 3-slot probability + fallback"
+  ]
+}

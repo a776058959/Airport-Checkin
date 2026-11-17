@@ -3,3 +3,4 @@ __pycache__/
 .panel-cache/
 .panel-cache*
 state/
+client-recon/lib/
