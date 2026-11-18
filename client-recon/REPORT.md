@@ -130,3 +130,47 @@ TLS 握手：通过
 - `client-recon/REPORT.md` — 本文
 - `client-recon/findings.json` — 结构化事实（已脱敏）
 - `client-recon/certs/client.der` — 从内存提取的客户端证书（仅公钥，1315 字节）
+
+---
+
+## 六、补充验证（10:25）
+
+### CNG 密钥逐一比对：无匹配
+
+枚举 `%APPDATA%\Microsoft\Crypto\Keys` 全部 13 个密钥容器，用 `CngKey.Open` + `RSACng` 导出公钥模数，与客户端证书模数逐一比对：
+
+```
+client cert modulus (b64, 前 40): lu1E0YPtlckG6N84sq2yNL//h0kYIaaVR5LEI23f
+client cert modulus bytes: 384  (= RSA 3072)
+CNG key files: 13
+RESULT: no CNG key in the user profile matches this certificate
+```
+
+**13 个密钥容器没有一个匹配。** 私钥不在这台机器的用户配置中。
+
+### 证书链验证：私有 CA
+
+```
+Subject : CN=SkyVPN Android Client, O=SkyVPN
+Issuer  : CN=SkyVPN Client Auth CA, O=SkyVPN
+Chain build: False
+Status  : PartialChain — 无法构建到受信任的根
+```
+
+`SkyVPN Client Auth CA` 是**自建私有 CA**，不受系统信任，只有服务端持有其根证书。
+
+这解释了为什么自签证书会得到 `TLSV1_ALERT_UNKNOWN_CA`：服务端用私有 CA 的根证书校验客户端，必须持有该 CA 签发的证书及配对私钥。
+
+### RSA 密钥长度
+
+证书公钥是 **RSA 3072**（模数 384 字节）。这类服务端通常还会校验 signature algorithm 与 key size，进一步排除用弱密钥伪造的可能。
+
+### 小结
+
+三条独立证据链全部指向同一结论：
+
+1. 证书公钥在内存可读，但 `HasPrivateKey=False`
+2. 用户配置下 13 个 CNG 密钥容器无一与证书模数匹配
+3. 服务端使用私有 CA 校验，自签证书被 `unknown CA` 拒绝
+
+**私钥不可导出，客户端 mTLS 无法在 GitHub Actions 上复现。**
