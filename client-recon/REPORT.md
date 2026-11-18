@@ -1,158 +1,132 @@
 # SKY VPN 客户端分析报告
 
-分析时间：2026-11-18 凌晨
+分析时间：2026-11-18（分两轮）
 样本：`C:\Program Files\SKY VPN\`（已安装、已登录）
 安装包：`D:\迅雷下载\SKY-VPN-Setup-0.6.5.exe`
 
 ---
 
-## 一句话结论
+## 最终结论
 
-**挖到了完整实现，但不能搬到 GitHub Actions 上跑。**
+**客户端证书已经找到，但私钥拿不到，因此仍无法搬到 GitHub Actions。**
 
-客户端签到链路已完整还原（`PanelApi.SignInAsync` → `ActionAsync` → `/user/checkin`），路径与网页版**完全一致**。但客户端走的是 **mTLS 双向认证**，服务器强制要求客户端证书，没有证书连 HTTP 请求都发不出去。证书不在安装包里，是运行时下载的，且会话 `session.dat` 用 DPAPI 加密（只能在你这台机器这个 Windows 账号下解）。
+第二轮把证书本身挖出来了（`client-recon/certs/client.der`），但它是**只有公钥的证书**，私钥受 Windows CNG 保护、无法导出。实测证明服务端校验完整证书链，光有证书不够。
 
 ---
 
-## 一、客户端技术栈
+## 一、第二轮的主要突破
 
-| 项 | 内容 |
+### 1. 解开了 session.dat（DPAPI）
+
+```powershell
+[ProtectedData]::Unprotect($bytes, $null, [DataProtectionScope]::CurrentUser)
+```
+
+得到明文（1126 字节 JSON），内容是 7 个 cookie：
+
+| Cookie | 值 |
 | --- | --- |
-| 运行时 | **.NET 10**（`NETCoreApp,Version=v10.0/win-x64`） |
-| UI | Avalonia 11.3.23 + SkiaSharp |
-| 核心程序集 | `SkyVpn.Core` 0.6.5、`SkyVpn.SetupPayload` 0.6.5（安装载荷，内含 mihomo） |
-| 代理内核 | `core\mihomo.exe` 61 MB（Clash Meta） |
-| 打包 | .NET single-file bundle，manifest 在文件末尾 |
+| `PHPSESSID` | r3h2pb0m3pmk04q7qiiba0hvdo |
+| `email` | 776058959%40qq.com |
+| `expire_in` | 1795545339 |
+| `ip` | a7aebc6224021924c12cc0f5bc9f959e |
+| `key` | 809c333c736b440fddb31251e737f517eeb7ff341df1d |
+| `server_name_session` | af483a39578cbf53e6a3698e3fa52770 |
+| `uid` | 4732 |
 
-### 解包方法（已验证可用）
+全部 domain 为 `client.skyvpn.bond`。**能从本机解出，但这是 DPAPI CurrentUser 加密，换机器/换用户就解不开。**
 
-manifest 在文件末尾，每条记录：
+### 2. 从进程内存扫出了客户端证书
 
-```
-Offset(8) Size(8) CompressedSize(8) Type(1) PathLen(1) Path(PathLen)
-```
+方法：`VirtualQueryEx` 遍历可读 `MEM_COMMIT` 区，`ReadProcessMemory` 分块读取，按 DER X.509 特征（`30 82 .. 30 82`）提取。
 
-压缩数据用 **raw deflate**（`zlib.decompressobj(-15)`）。已成功提取：
-
-- `SkyVpn.Core.dll` — offset `0x2e68969`，size 3397632，csize 790994
-- `SkyVpn.SetupPayload.dll` — offset `0x2f29b3b`，size 66071040，csize 23865080
-
----
-
-## 二、完整 API 清单（`SkyVpn.Core.PanelApi`）
-
-**Base URL：`https://client.skyvpn.bond`** → `163.52.242.61`（与网页面板同 IP）
-
-签到链路：
+结果：439 个候选，去重 114 个，其中两个与 skyvpn 相关：
 
 ```
-SignInAsync      → POST /auth/login
-BootstrapAsync   → 启动时拉账号信息
-ActionAsync      → POST /user/checkin     ← 签到
-ProfileAsync     → /profile
-ClashProfileAsync→ 拉订阅
+Subject : CN=SkyVPN Android Client, O=SkyVPN
+Issuer  : CN=SkyVPN Client Auth CA, O=SkyVPN
+Serial  : 0x7d32cd9b7b73e0a54f15e1f39ae1bfad
+NotBefore: 2026-04-06 03:08:23 UTC
+NotAfter : 2028-04-06 03:18:23 UTC
+PubKey  : RSA
+Thumb   : 72129AFE3CB8D4973CD75CB6F754B96D8C286B73
+
+EKU     : clientAuth (1.3.6.1.5.5.7.3.2)
+SAN     : client.skyvpn.bond, android-client@client.skyvpn.bond
+KeyUsage: digitalSignature + keyEncipherment
 ```
 
-其余方法：`RecordsAsync`（流量记录）、`AnnouncementsAsync` / `NoticesAsync`（公告）、`SignOutAsync`、`ProductsAsync` / `OrdersAsync` / `BuyAsync` / `QuoteAsync` / `WalletAsync` / `CreateRechargeAsync` / `RechargeIsPaidAsync`（商店与充值）、`TicketsAsync` / `TicketAsync` / `CreateTicketAsync` / `ReplyTicketAsync`（工单）、`RegisterAsync` / `AuthConfigAsync` / `RequestPasswordResetAsync`、`UpdateEmailAsync` / `UpdateNicknameAsync` / `ResetInviteCodeAsync`、`ConversionPreviewAsync` / `DisableAutoRenewAsync` / `DeletePendingOrderAsync` / `InviteSummaryAsync` / `AccountDetailsAsync` / `TelegramBotAsync`。
+已保存为 `client-recon/certs/client.der`。
 
-**全部路径与网页版 SSPanel 一致**，没有任何新增的绕过能力。
+**注意 Subject 是「Android Client」**——说明这是所有安卓/桌面用户**共用**的同一张证书。
 
----
+### 3. 但私钥拿不到
 
-## 三、决定性障碍：mTLS + 证书来源
-
-`client.skyvpn.bond` 强制客户端证书。实测：
-
-```
-TLS1.3 无证书 -> 数据阶段 ssl3_read_bytes: certificate required
-TLS1.2 无证书 -> ssl/tls alert bad certificate
-```
-
-证书信息：
-
-- 引用路径 **`assets/certs/skyvpn-client.pfx.enc`**（`SkyVpn.Core.dll` 的 #Strings 堆里）
-- **不在 SkyVPN.exe 里**（已全文搜索确认）
-- **不在 SkyVpn.SetupPayload.dll 里**（已解压 66 MB 确认）
-- 结论：**运行时从服务器下载**，且 `.enc` 说明还要解密
-- 解密依赖 `System.Security.Cryptography.ProtectedData`（DPAPI）与 `X509CertificateLoader`
-
-### 三层阻塞
-
-| 层 | 问题 |
+| 检查项 | 结果 |
 | --- | --- |
-| 传输层 | 无客户端证书，连请求都发不出去 |
-| 证书获取 | 要下载 + 解密 `.enc`，密钥在程序里，需继续逆向 |
-| 会话 | `session.dat` 是 DPAPI 加密，**只能在本机本账号解密**，Actions 完全用不了 |
+| 内存中该证书对象 `HasPrivateKey` | **False**（只有公钥） |
+| 内存中的明文 PKCS#8 / PKCS#1 / EC 私钥 | 扫描 0 个 |
+| `CurrentUser\My`、`LocalMachine\My` 等全部证书存储 | 无该 thumbprint 条目 |
+| `%APPDATA%\Microsoft\Crypto\Keys`（CNG） | 有今日新建的密钥文件，但对应的是其他证书 |
+
+私钥保存在 CNG（Key Storage Provider）里，由 OS 保护，程序只能"使用"不能"读出"。
+
+### 4. 关键验证：服务端校验证书链
+
+用抓到的证书 + 自签 RSA 私钥发起 mTLS：
+
+```
+TLS 握手：通过
+服务端回应：TLSV1_ALERT_UNKNOWN_CA
+```
+
+**证明服务端做完整证书链校验**，必须有与这张证书配对的真私钥，伪造/替换都不行。
 
 ---
 
-## 四、为什么客户端看起来更"健壮"
+## 二、两套体系是分开的（重要）
 
-用户观察正确：客户端点签到从不报 429。
+| 域名 | 是否要 mTLS | 会话 |
+| --- | --- | --- |
+| `client.skyvpn.bond` | **要**（强制） | 客户端专用，cookie 带 `key`/`uid` |
+| `q210ycweb.skyvpn.bond`（面板） | 不要 | 网页版，需账号密码登录 |
 
-原因不是 API 更强，而是：
+实测：把 `client.` 的 7 个 cookie 拿去 POST 面板域名 `/user/checkin`，返回 **302 → /auth/login**，说明两边会话不通用。
 
-- 客户端用 **mTLS 认证官方客户端身份**，服务器把它当可信客户端，限流策略与入口站的匿名 continue 完全不同
-- 网页版走 `www.skyxcloud.cc` 的**匿名** continue 接口，每 IP 有配额（实测约 40-50% 成功率）
-
-**但客户端身份无法搬到 CI**：证书 + DPAPI 会话都是本机绑定的。把证书塞进 GitHub Secrets 也等于公开泄露所有用户共用的客户端凭据。
-
----
-
-## 五、客户端为什么不显示已有签到状态
-
-`settings.json` 的 `CheckedInOn` 是**客户端本地写的日期**（当前 `2026-11-18`），启动时**不向服务端查询签到状态**。
-
-所以：在网页/工作流签到后，客户端仍显示"签到"按钮；只有点了客户端里的签到（`ActionAsync`）成功，才写本地日期并显示"已签到"。这与你描述的现象完全吻合。
+面板域名本身不要求证书（`/` 返回 200 完整 HTML，`/user/checkin` GET 返回 405 Method Not Allowed 说明端点存在），这就是现在网页脚本走的路。
 
 ---
 
-## 六、投入产出评估
+## 三、为什么这条路走不通
 
-**要继续走客户端路线，必须做完：**
+用户设想：「证书部分用软件的、其余自己写」。技术前提是证书+私钥能脱离本机。现在的障碍是：
 
-1. 找到 `assets/certs/skyvpn-client.pfx.enc` 的下载地址（需抓包或继续逆向 `PanelClient`）
-2. 还原 `.enc` 的解密逻辑，拿到 pfx + 密码
-3. 验证证书是否绑定 `DeviceUid`（若绑定，每台机器都要单独提取）
-4. 解决 DPAPI 会话问题（Actions 上无解，除非 `/auth/login` 不需要 mTLS——实测整个域名都要）
-5. 承担凭据公开风险
+1. **私钥不可导出** —— CNG 保护，程序也只能调 API 用不能读
+2. **service 进程有 DPAPI 相关的密钥操作** —— 即便找到私钥位置，也可能二次加密
+3. **证书是所有用户共用的** —— 若真能导出并放进公开仓库的 Secrets，等于公开泄露
 
-**而现有网页方案已经达标**：三时段概率抽取 + 保底 + 缓存，实测 run #3、#6、#7 全部成功，每天必成一次。429 只是让"某一次"失败，不影响"每天签上"。
+要继续只有一条路：**动态 hook**（Frida / Detours），在客户端建立 TLS 连接时截获 `ClientCertificateSelectionCallback` 的返回值，或 hook `SslStream` 拿到 `X509Certificate2` 对象后调用其签名操作做代理转发。这条路：
+
+- 技术上可行（证书对象在进程内可用）
+- 但**只能在 Windows 本机跑**，无法进 GitHub Actions
+- 等于「本机常开一个转发服务」→ 与直接本机跑脚本没区别
 
 ---
 
-## 七、产出物
+## 四、现有方案对比
+
+| 方案 | 能否在 Actions 跑 | 429 影响 | 维护成本 |
+| --- | --- | --- | --- |
+| **网页版（现状）** | 能 | 有，但三时段+保底已覆盖 | 低 |
+| 客户端 API 直连 | **不能**（私钥不可导出） | 无 | — |
+| 本机 hook 转发 | 不能（需 Windows 常开） | 无 | 高 |
+
+**结论：维持现有网页方案。**
+
+---
+
+## 五、产出物
 
 - `client-recon/REPORT.md` — 本文
 - `client-recon/findings.json` — 结构化事实（已脱敏）
-- `_skyx/lib/SkyVpn.Core.dll` — 核心程序集 3.4 MB（临时目录）
-- `_skyx/lib/SkyVpn.SetupPayload.dll` — 安装载荷 66 MB（临时目录）
-
----
-
-## 八、追加验证（2026-11-18 02:xx，完整权限下）
-
-用户提出「能不能直接用它的证书」后做了穷尽式排查，结论是**本机拿不到**：
-
-| 位置 | 结果 |
-| --- | --- |
-| `C:\Program Files\SKY VPN\` 全目录 | 无 .pfx/.p12/.pem/.crt |
-| `SkyVPN.exe`（73MB）全文 | 无 PKCS12 DER；`assets/certs/skyvpn-client.pfx.enc` 仅作为字符串出现 |
-| `SkyVpn.Core.dll`（3.4MB，已从 bundle 解出） | PKCS12 DER 命中 **0**；证书名只在 #Strings 堆 |
-| `SkyVpn.SetupPayload.dll`（66MB，已解压） | 无 pfx 字符串 |
-| 进程内存（PID 16656 UI 进程，541MB） | 59 个 PKCS12，**全部**是 Microsoft 时间戳证书（exe 数字签名的证书链） |
-| 进程内存（PID 972 service 进程，149MB） | 32 个 PKCS12，同样全是 Microsoft 时间戳 |
-| 系统证书存储（CurrentUser\My / LocalMachine\My） | 无 skyvpn 相关 |
-| 磁盘全盘（AppData / ProgramData） | 无 .pfx/.p12/.pem 命中 |
-
-**结论：证书（`.pfx.enc`）是运行时从服务端下载的加密 blob，解密密钥在 .NET 10 程序内部。**
-
-要拿到它必须：装 .NET 10 SDK → ilspycmd 反编译 `SkyVpn.Core.dll` → 定位 `PanelClient.DownloadAsync` 的下载地址 → 还原 `.enc` 解密逻辑（`ProtectedData` + 可能 AES）→ 得到 pfx 密码。
-
-**这仍是本机可做的**，但需要 .NET 10 SDK（本机只有 .NET 8 运行时）。
-
-### 关键教训（工具层）
-
-- PowerShell 脚本**不能用中文**：本机 PowerShell 5.1 读 UTF-8 无 BOM 的 .ps1 会按 GBK 解码，中文变乱码导致字符串未闭合语法错误。所有 .ps1 必须纯英文。
-- Windows PowerShell 5.1 基于 .NET Framework，**加载不了 .NET 10 程序集**（`0x80131515 Operation is not supported`），反射调用这条路需要 PowerShell 7+。
-- 进程内存扫描用 `VirtualQueryEx` + `ReadProcessMemory` 遍历 `MEM_COMMIT` 且可读（0x02/0x04/0x08/0x20/0x40）区域有效，能抓到 91 个证书但对目标无用。
+- `client-recon/certs/client.der` — 从内存提取的客户端证书（仅公钥，1315 字节）
